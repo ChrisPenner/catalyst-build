@@ -31,6 +31,7 @@ dependencies:
 - unix
 - stm
 - bifunctors
+- indexed-traversable
 
 library:
   source-dirs: src

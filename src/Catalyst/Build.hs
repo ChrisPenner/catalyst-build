@@ -6,6 +6,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE Arrows #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module Catalyst.Build where
 import Control.Arrow
 import Control.Category ( Category )
@@ -21,38 +22,38 @@ import Data.IORef (newIORef, readIORef, writeIORef, IORef)
 import System.Posix.Files
 import Prelude hiding (readFile)
 import Control.Monad.State
-import System.Posix (EpochTime, getWorkingDirectory)
 import Control.Concurrent
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM
 import Data.Profunctor.Strong
 import Data.Profunctor.Traversing
-import qualified Data.IntMap as IM
 import qualified Data.Bifunctor as BF
 import Data.Function
 import Data.Traversable
+import Data.Traversable.WithIndex
+import qualified Data.Map as Map
 
 newtype Build (m :: * -> *) i o =
     Build (IO (IO Status, i -> m o))
     deriving (Category, Arrow, Profunctor, Choice, Strong, Closed) via (Cayley IO (CatProd (Mon (Tracker IO)) (Kleisli m)))
 
 -- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
-instance MonadIO m => Traversing (Build m) where
-  traverse' (Build setup) = Build $ do
-      stashRef <- newIORef IM.empty
-      let envCheck = do
-            readIORef stashRef >>= foldMap fst
-      pure . (envCheck,) $ \xs -> do
-          funcMap <- liftIO $ readIORef stashRef
-          (os, (resultMap, splitPoint)) <- flip runStateT (funcMap, 0) . for xs $ \x -> do
-              (innerMap, i) <- get
-              modify (second succ)
-              IM.lookup i innerMap & \case
-                Nothing -> liftIO setup >>= \r@(_, f) -> modify (BF.first (IM.insert i r)) *> liftIO (putStrLn $ "initializing: " <> show i) *> lift (f x)
-                Just (_, f) -> lift $ f x
-          let (prunedMap, _) = IM.split splitPoint resultMap
-          liftIO $ writeIORef stashRef prunedMap
-          pure os
+-- instance MonadIO m => Traversing (Build m) where
+  -- traverse' = _
+
+itraverse' :: (Show i, Ord i, MonadIO m, TraversableWithIndex i t) => Build m a b -> Build m (t a) (t b)
+itraverse' (Build setup) = Build $ do
+    stashRef <- newIORef Map.empty
+    let envCheck = do
+          readIORef stashRef >>= foldMap fst
+    pure . (envCheck,) $ \xs -> do
+        funcMap <- liftIO $ readIORef stashRef
+        (os, resultMap) <- flip runStateT Map.empty . ifor xs $ \i x -> do
+            Map.lookup i funcMap & \case
+              Nothing -> liftIO setup >>= \r@(_, f) -> modify (Map.insert i r) *> liftIO (putStrLn $ "initializing: " <> show i) *> lift (f x)
+              Just r@(_, f) -> modify (Map.insert i r) *> lift (f x)
+        liftIO $ writeIORef stashRef resultMap
+        pure os
 
 newtype Tracker checkM =
     Tracker (checkM Status)
@@ -175,13 +176,10 @@ debounced millis = Build $ do
 example :: IO ()
 example = do
     -- watch (pure "README.md") (BS.putStrLn) (readFile)
-    watch (pure "deps.txt") (traverse printFile) $ proc inp -> do
+    watch (pure "deps.txt") (itraverse printFile) $ proc inp -> do
         deps <- (cached (tap <<< readFile)) -< inp
-        traverse' readFile -< BS.unpack <$> BS.lines deps
+        itraverse' readFile -< Map.fromList ((\x -> (x, x)) . BS.unpack <$> BS.lines deps)
   where
-    printFile = \f -> do
-        BS.putStrLn "==================="
+    printFile = \name f -> do
+        BS.putStrLn (BS.pack name <> "===================")
         BS.putStrLn f
-    markdownify = arrM $ \fp -> do
-        Prelude.putStrLn $ "***" <> fp
-        pure $ fp <> ".md"
