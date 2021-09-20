@@ -29,6 +29,7 @@ dependencies:
 - catalyst
 - directory
 - unix
+- stm
 
 library:
   source-dirs: src

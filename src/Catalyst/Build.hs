@@ -20,6 +20,9 @@ import System.Posix.Files
 import Prelude hiding (readFile)
 import Control.Monad.State
 import System.Posix (EpochTime)
+import Control.Concurrent
+import Control.Concurrent.STM.TVar
+import Control.Concurrent.STM
 
 newtype Build (m :: * -> *) i o =
     Build (IO (IO Status, i -> m o))
@@ -43,10 +46,10 @@ build readInput handle (Build setup) = do
 
 watch :: (MonadIO m) => m i -> (o -> m r) -> Build m i o -> m a
 watch readInput handle (Build setup) = do
-    (checker, f) <- liftIO setup
+    (envCheck, f) <- liftIO setup
     let looper = forever $ do
-          liftIO checker >>= \case
-            Dirty -> readInput >>= f >>= handle >> pure ()
+          liftIO envCheck >>= \case
+            Dirty -> void (readInput >>= f >>= handle)
             Clean -> pure ()
     looper
 
@@ -66,7 +69,7 @@ fileModified = Build $ do
               Just fp -> do
                 t <- modificationTime <$> liftIO (getFileStatus fp)
                 get >>= \case
-                  Just oldT 
+                  Just oldT
                     | oldT >= t -> pure Clean
                   _ -> put (Just t) *> pure Dirty
     checker <- ambient Nothing check'
@@ -97,7 +100,7 @@ eq a b = if a == b then Clean else Dirty
 
 cached' :: MonadIO m => (i -> i -> Status) -> Build m i o -> Build m i o
 cached' inputDiff (Build setup) = Build $ do
-    (check, f) <- setup
+    (checker, f) <- setup
     lastRunRef <- newIORef Nothing
     let inner i = do
           liftIO (readIORef lastRunRef) >>= \case
@@ -106,7 +109,7 @@ cached' inputDiff (Build setup) = Build $ do
             _ -> do o <- f i
                     liftIO $ writeIORef lastRunRef (Just (i, o))
                     pure o
-    pure (check, inner)
+    pure (checker, inner)
 
 ambient :: s -> StateT s IO Status -> IO (IO Status)
 ambient initial next = do
@@ -118,10 +121,22 @@ ambient initial next = do
 
 static :: Applicative m => Build IO i o -> i -> Build m () o
 static (Build setup) i = Build $ do
-    (check, f) <- setup
+    (checker, f) <- setup
     o <- f i
-    pure $ (check, const $ pure o)
+    pure $ (checker, const $ pure o)
+
+type Millis = Int
+debounced :: Applicative m => Millis -> Build m i i
+debounced millis = Build $ do
+    var <- newTVarIO Clean
+    void . forkIO . forever $ atomically (writeTVar var Dirty) *> threadDelay (millis * 1000)
+    pure $ (atomically (readTVar var <* writeTVar var Clean), pure)
 
 example :: IO ()
 example = do
-    watch (pure "README.md") (BS.putStrLn) (readFile)
+    -- watch (pure "README.md") (BS.putStrLn) (readFile)
+    watch (pure "README") (BS.putStrLn) (cached (debounced 1000) >>> markdownify >>> arrM BS.readFile)
+  where
+    markdownify = arrM $ \fp -> do
+        Prelude.putStrLn $ "***" <> fp
+        pure $ fp <> ".md"

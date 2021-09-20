@@ -38,6 +38,7 @@ library
     , directory
     , mtl
     , profunctors
+    , stm
     , transformers
     , unix
   default-language: Haskell2010
@@ -58,6 +59,7 @@ executable catalyst-build-exe
     , directory
     , mtl
     , profunctors
+    , stm
     , transformers
     , unix
   default-language: Haskell2010
@@ -79,6 +81,7 @@ test-suite catalyst-build-test
     , directory
     , mtl
     , profunctors
+    , stm
     , transformers
     , unix
   default-language: Haskell2010
