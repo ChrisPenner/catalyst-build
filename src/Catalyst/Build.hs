@@ -12,7 +12,7 @@ import Control.Arrow
 import Control.Category ( Category )
 import Control.Monad
 import Control.Applicative
-import Data.Profunctor (Profunctor, Choice, Closed)
+import Data.Profunctor
 import qualified Data.ByteString.Char8 as BS
 import Control.Category.Product
 import Control.Category.Mon
@@ -25,22 +25,39 @@ import Control.Monad.State
 import Control.Concurrent
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM
-import Data.Profunctor.Strong
-import Data.Profunctor.Traversing
-import qualified Data.Bifunctor as BF
 import Data.Function
-import Data.Traversable
 import Data.Traversable.WithIndex
 import qualified Data.Map as Map
 
 newtype Build (m :: * -> *) i o =
     Build (IO (IO Status, i -> m o))
-    deriving (Category, Arrow, Profunctor, Choice, Strong, Closed) via (Cayley IO (CatProd (Mon (Tracker IO)) (Kleisli m)))
+    deriving (Category, Arrow, Profunctor, Strong, Closed) via (Cayley IO (CatProd (Mon (Tracker IO)) (Kleisli m)))
+
+data LR = L | R
+  deriving (Eq)
+
+-- The derived version is too greedy with regard to the Status check.
+instance MonadIO m => Choice (Build m) where
+  left' (Build setup) = Build $ do
+      (envCheck, f) <- setup
+      dirRef <- newIORef L
+      let go = \case
+                 Left a -> do
+                     liftIO $ writeIORef dirRef L
+                     Left <$> f a
+                 Right x -> do
+                     liftIO $ writeIORef dirRef R
+                     pure $ Right x
+      let newCheck = do
+            readIORef dirRef >>= \case
+              L -> envCheck
+              R -> pure Clean
+      pure $ (newCheck, go)
+
+instance MonadIO m => ArrowChoice (Build m) where
+  left = left'
 
 -- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
--- instance MonadIO m => Traversing (Build m) where
-  -- traverse' = _
-
 itraverse' :: (Show i, Ord i, MonadIO m, TraversableWithIndex i t) => Build m a b -> Build m (t a) (t b)
 itraverse' (Build setup) = Build $ do
     stashRef <- newIORef Map.empty
@@ -176,9 +193,12 @@ debounced millis = Build $ do
 example :: IO ()
 example = do
     -- watch (pure "README.md") (BS.putStrLn) (readFile)
-    watch (pure "deps.txt") (itraverse printFile) $ proc inp -> do
+    watch (pure "deps.txt") (BS.putStrLn) $ proc inp -> do
         deps <- (cached (tap <<< readFile)) -< inp
-        itraverse' readFile -< Map.fromList ((\x -> (x, x)) . BS.unpack <$> BS.lines deps)
+        let depFiles = BS.unpack <$> BS.lines deps
+        if length depFiles > 2 then readFile -< "README.md"
+                               else debounced 1000 <<< readFile -< "Changelog.md"
+        -- itraverse' readFile -< Map.fromList ((\x -> (x, x)) <$> depFiles)
   where
     printFile = \name f -> do
         BS.putStrLn (BS.pack name <> "===================")
