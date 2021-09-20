@@ -16,18 +16,16 @@ import Data.Profunctor
 import qualified Data.ByteString.Char8 as BS
 import Control.Category.Product
 import Control.Category.Mon
-import Control.Monad.IO.Class
 import Data.Profunctor.Cayley
 import System.Posix.Files
 import Prelude hiding (readFile)
 import Control.Monad.State
-import Control.Concurrent
-import UnliftIO.STM
 import Data.Function
 import Data.Traversable.WithIndex
 import qualified Data.Map as Map
 import Data.Maybe
 import UnliftIO
+import UnliftIO.Concurrent
 
 newtype Build (m :: * -> *) i o =
     Build (IO (StatusTracker, i -> m o))
@@ -58,7 +56,7 @@ instance MonadIO m => Choice (Build m) where
       dirRef <- newTVarIO L
       let go = \case
                  Left a -> do
-                     liftIO $ atomically . writeTVar dirRef $ L
+                     atomically . writeTVar dirRef $ L
                      Left <$> f a
                  Right x -> do
                      atomically $ writeTVar dirRef R
@@ -100,18 +98,21 @@ watch readInput handler (Build setup) = do
     (ST envCheck, f) <- liftIO setup
     void (atomically readInput >>= f >>= handler)
     forever $ do
-          liftIO $ threadDelay 500000
-          atomically (envCheck) -- wait for env changes
+          threadDelay 500000
+          atomically envCheck -- wait for env changes
           void (atomically readInput >>= f >>= handler)
 
 arrM :: (i -> m o) -> Build m i o
 arrM f = Build (pure (mempty, f))
 
+arrIO :: MonadIO m => (i -> IO o) -> Build m i o
+arrIO f = Build (pure (mempty, liftIO . f))
+
 readFile :: MonadIO m => Build m FilePath BS.ByteString
-readFile = cached (fileModified >>> (arrM (liftIO . BS.readFile)))
+readFile = cached (fileModified >>> (arrIO BS.readFile))
 
 tap :: (MonadIO m, Show a) => Build m a a
-tap = arrM $ \a -> liftIO (print a) *> pure a
+tap = arrIO $ \a -> print a *> pure a
 
 fileModified :: MonadIO m => Build m FilePath FilePath
 fileModified = Build $ do
@@ -188,14 +189,6 @@ waitJust :: TVar (Maybe a) -> STM a
 waitJust var = readTVar var >>= \case
   Nothing -> retrySTM
   Just a -> pure a
-
-ambient :: s -> StateT s IO Status -> IO (IO Status)
-ambient initial next = do
-    stateRef <- newIORef initial
-    pure $ do
-        (dirty, nextS) <- readIORef stateRef >>= runStateT next
-        writeIORef stateRef nextS
-        pure dirty
 
 static :: Applicative m => Build IO i o -> i -> Build m () o
 static (Build setup) i = Build $ do
