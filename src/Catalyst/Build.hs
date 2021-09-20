@@ -44,12 +44,14 @@ instance MonadIO m => Traversing (Build m) where
             readIORef stashRef >>= foldMap fst
       pure . (envCheck,) $ \xs -> do
           funcMap <- liftIO $ readIORef stashRef
-          (os, (resultMap, _)) <- flip runStateT (funcMap, 0) . for xs $ \x -> do
+          (os, (resultMap, splitPoint)) <- flip runStateT (funcMap, 0) . for xs $ \x -> do
               (innerMap, i) <- get
+              modify (second succ)
               IM.lookup i innerMap & \case
                 Nothing -> liftIO setup >>= \r@(_, f) -> modify (BF.first (IM.insert i r)) *> liftIO (putStrLn $ "initializing: " <> show i) *> lift (f x)
                 Just (_, f) -> lift $ f x
-          liftIO $ writeIORef stashRef resultMap
+          let (prunedMap, _) = IM.split splitPoint resultMap
+          liftIO $ writeIORef stashRef prunedMap
           pure os
 
 newtype Tracker checkM =
@@ -174,7 +176,7 @@ example :: IO ()
 example = do
     -- watch (pure "README.md") (BS.putStrLn) (readFile)
     watch (pure "deps.txt") (traverse printFile) $ proc inp -> do
-        deps <- readFile -< inp
+        deps <- (cached (tap <<< readFile)) -< inp
         traverse' readFile -< BS.unpack <$> BS.lines deps
   where
     printFile = \f -> do
