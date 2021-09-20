@@ -32,6 +32,8 @@ dependencies:
 - stm
 - bifunctors
 - indexed-traversable
+- async
+- unliftio
 
 library:
   source-dirs: src
