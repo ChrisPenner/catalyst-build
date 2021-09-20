@@ -4,12 +4,14 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE Arrows #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Catalyst.Build where
 import Control.Arrow
 import Control.Category ( Category )
 import Control.Monad
 import Control.Applicative
-import Data.Profunctor ()
+import Data.Profunctor (Profunctor, Choice, Closed)
 import qualified Data.ByteString.Char8 as BS
 import Control.Category.Product
 import Control.Category.Mon
@@ -19,14 +21,36 @@ import Data.IORef (newIORef, readIORef, writeIORef, IORef)
 import System.Posix.Files
 import Prelude hiding (readFile)
 import Control.Monad.State
-import System.Posix (EpochTime)
+import System.Posix (EpochTime, getWorkingDirectory)
 import Control.Concurrent
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM
+import Data.Profunctor.Strong
+import Data.Profunctor.Traversing
+import qualified Data.IntMap as IM
+import qualified Data.Bifunctor as BF
+import Data.Function
+import Data.Traversable
 
 newtype Build (m :: * -> *) i o =
     Build (IO (IO Status, i -> m o))
-    deriving (Category, Arrow) via (Cayley IO (CatProd (Mon (Tracker IO)) (Kleisli m)))
+    deriving (Category, Arrow, Profunctor, Choice, Strong, Closed) via (Cayley IO (CatProd (Mon (Tracker IO)) (Kleisli m)))
+
+-- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
+instance MonadIO m => Traversing (Build m) where
+  traverse' (Build setup) = Build $ do
+      stashRef <- newIORef IM.empty
+      let envCheck = do
+            readIORef stashRef >>= foldMap fst
+      pure . (envCheck,) $ \xs -> do
+          funcMap <- liftIO $ readIORef stashRef
+          (os, (resultMap, _)) <- flip runStateT (funcMap, 0) . for xs $ \x -> do
+              (innerMap, i) <- get
+              IM.lookup i innerMap & \case
+                Nothing -> liftIO setup >>= \r@(_, f) -> modify (BF.first (IM.insert i r)) *> liftIO (putStrLn $ "initializing: " <> show i) *> lift (f x)
+                Just (_, f) -> lift $ f x
+          liftIO $ writeIORef stashRef resultMap
+          pure os
 
 newtype Tracker checkM =
     Tracker (checkM Status)
@@ -47,7 +71,9 @@ build readInput handle (Build setup) = do
 watch :: (MonadIO m) => m i -> (o -> m r) -> Build m i o -> m a
 watch readInput handle (Build setup) = do
     (envCheck, f) <- liftIO setup
+    void (readInput >>= f >>= handle)
     let looper = forever $ do
+          liftIO $ threadDelay 500000
           liftIO envCheck >>= \case
             Dirty -> void (readInput >>= f >>= handle)
             Clean -> pure ()
@@ -57,30 +83,38 @@ arrM :: (i -> m o) -> Build m i o
 arrM f = Build (pure (mempty, f))
 
 readFile :: MonadIO m => Build m FilePath BS.ByteString
-readFile = cached (fileModified >>> arrM (liftIO . BS.readFile))
+readFile = cached (fileModified >>> (arrM (liftIO . BS.readFile)))
+
+tap :: (MonadIO m, Show a) => Build m a a
+tap = arrM $ \a -> liftIO (print a) *> pure a
 
 fileModified :: MonadIO m => Build m FilePath FilePath
 fileModified = Build $ do
-    (fpRef, go) <- trackInput $ pure
-    let check' :: StateT (Maybe EpochTime) IO Status
+    (fpRef, tRef, go) <- trackInput 0 $ \fp -> do
+        t <- modificationTime <$> liftIO (getFileStatus fp)
+        pure (t, fp)
+    let check' :: IO Status
         check' = do
             liftIO (readIORef fpRef) >>= \case
               Nothing -> pure Dirty
               Just fp -> do
-                t <- modificationTime <$> liftIO (getFileStatus fp)
-                get >>= \case
-                  Just oldT
-                    | oldT >= t -> pure Clean
-                  _ -> put (Just t) *> pure Dirty
-    checker <- ambient Nothing check'
-    pure $ (checker, go)
+                -- liftIO getWorkingDirectory >>= liftIO . print
+                lastT <- readIORef tRef
+                currentT <- modificationTime <$> liftIO (getFileStatus fp)
+                if lastT >= currentT
+                     then pure Clean
+                     else pure Dirty
+    pure $ (check', go)
 
-trackInput :: MonadIO m => (i -> m o) -> IO (IORef (Maybe i), i -> m o)
-trackInput f = do
-    ref <- newIORef Nothing
-    pure $ (ref,) $ \i -> do
-        liftIO $ writeIORef ref (Just i)
-        f i
+trackInput :: MonadIO m => s -> (i -> m (s, o)) -> IO (IORef (Maybe i), IORef s, i -> m o)
+trackInput def f = do
+    inpRef <- newIORef Nothing
+    stateRef <- newIORef def
+    pure $ (inpRef,stateRef,) $ \i -> do
+        liftIO $ writeIORef inpRef (Just i)
+        (s, o) <- f i
+        liftIO $ writeIORef stateRef s
+        pure o
 
 data Status = Dirty | Clean
   deriving (Eq, Ord, Show)
@@ -103,12 +137,16 @@ cached' inputDiff (Build setup) = Build $ do
     (checker, f) <- setup
     lastRunRef <- newIORef Nothing
     let inner i = do
-          liftIO (readIORef lastRunRef) >>= \case
-            Just (lastInput, o)
-              | inputDiff lastInput i == Clean -> pure o
-            _ -> do o <- f i
-                    liftIO $ writeIORef lastRunRef (Just (i, o))
-                    pure o
+          let rerun = do o <- f i
+                         liftIO $ writeIORef lastRunRef (Just (i, o))
+                         pure o
+          liftIO checker >>= \case
+            Dirty -> rerun
+            Clean -> do
+              liftIO (readIORef lastRunRef) >>= \case
+                Just (lastInput, o)
+                  | inputDiff lastInput i == Clean -> pure o
+                _ -> rerun
     pure (checker, inner)
 
 ambient :: s -> StateT s IO Status -> IO (IO Status)
@@ -135,8 +173,13 @@ debounced millis = Build $ do
 example :: IO ()
 example = do
     -- watch (pure "README.md") (BS.putStrLn) (readFile)
-    watch (pure "README") (BS.putStrLn) (cached (debounced 1000) >>> markdownify >>> arrM BS.readFile)
+    watch (pure "deps.txt") (traverse printFile) $ proc inp -> do
+        deps <- readFile -< inp
+        traverse' readFile -< BS.unpack <$> BS.lines deps
   where
+    printFile = \f -> do
+        BS.putStrLn "==================="
+        BS.putStrLn f
     markdownify = arrM $ \fp -> do
         Prelude.putStrLn $ "***" <> fp
         pure $ fp <> ".md"

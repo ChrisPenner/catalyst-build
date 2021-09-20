@@ -32,6 +32,7 @@ library
       src
   build-depends:
       base >=4.7 && <5
+    , bifunctors
     , bytestring
     , catalyst
     , containers
@@ -52,6 +53,7 @@ executable catalyst-build-exe
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , bifunctors
     , bytestring
     , catalyst
     , catalyst-build
@@ -74,6 +76,7 @@ test-suite catalyst-build-test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , bifunctors
     , bytestring
     , catalyst
     , catalyst-build
