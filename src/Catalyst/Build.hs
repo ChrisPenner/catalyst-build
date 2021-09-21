@@ -16,7 +16,7 @@ import Data.Profunctor
 import qualified Data.ByteString.Char8 as BS
 import Data.Profunctor.Cayley
 import System.Posix.Files
-import Prelude hiding (readFile)
+import Prelude hiding (readFile, log)
 import Control.Monad.State
 import Data.Function
 import Data.Traversable.WithIndex
@@ -100,8 +100,14 @@ arrIO f = Build (pure (liftIO . f))
 -- readFile :: Build FilePath BS.ByteString
 -- readFile = cached (fileModified >>> (arrIO BS.readFile))
 
-tap :: (Show a) => Build a a
-tap = arrIO $ \a -> print a *> pure a
+trace :: (Show a) => Build a a
+trace = tap print
+
+log :: String -> Build a a
+log s = tap (const $ putStrLn s)
+
+tap :: (a -> IO b) -> Build a a
+tap f = arrIO $ \a -> f a *> pure a
 
 -- fileModified :: Build FilePath FilePath
 -- fileModified = Build $ do
@@ -148,26 +154,29 @@ instance Semigroup Status where
 instance Monoid Status where
   mempty = Clean
 
-cached :: (Eq i) => Build i o -> Build i o
+cached :: (Eq i) => Build i i
 cached = cached' eq
 
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
-cached' :: (i -> i -> Status) -> Build i o -> Build i o
-cached' inputDiff (Build setup) = Build $ do
-    f <- setup
+cached' :: (i -> i -> Status) -> Build i i
+cached' inputDiff = Build $ do
     lastRunRef <- newTVarIO Nothing
+    let rerun i = shiftT $ \cc -> do
+                    ccAsync <- liftIO . async $ cc i
+                    atomically $ writeTVar lastRunRef $ Just (i, ccAsync)
+                    pure ()
     pure $ \i -> do
         readTVarIO lastRunRef >>= \case
-          Just (lastInput, _)
+          Just (lastInput, lastCC)
             | inputDiff lastInput i == Clean -> do
-                shiftT $ \_cc -> do
-                    pure ()
-          _ -> do
-              o <- f i
-              atomically $ writeTVar lastRunRef $ Just (i, o)
-              pure o
+                -- We can leave the previous continuation running in the async
+                bail
+            | otherwise -> do
+                cancel lastCC
+                rerun i
+          Nothing -> rerun i
 
 waitJust :: TVar (Maybe a) -> STM a
 waitJust var = readTVar var >>= \case
@@ -194,11 +203,14 @@ counter = Build $ do
 example :: IO ()
 example = do
   watch (pure ()) (putStrLn) $ proc inp -> do
-      cnt <- counter  <<< (retrigger 2000) -< inp
+      cnt <- counter  <<< (retrigger 500) <<< log "after cache" <<< cached <<< counter <<< retrigger 2000 -< inp
       r <- if even cnt
                      then retrigger 500 -< cnt
                      else returnA -< cnt
       arr show -< r
+
+bail :: ContT () IO a
+bail = shiftT $ \_cc -> pure ()
 
 -- example :: IO ()
 -- example = do
