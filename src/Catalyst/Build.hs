@@ -98,7 +98,7 @@ arrIO :: (i -> IO o) -> Build i o
 arrIO f = Build (pure (liftIO . f))
 
 -- readFile :: Build FilePath BS.ByteString
--- readFile = cached (fileModified >>> (arrIO BS.readFile))
+-- readFile = cacheEq (fileModified >>> (arrIO BS.readFile))
 
 trace :: (Show a) => Build a a
 trace = tap print
@@ -154,8 +154,8 @@ instance Semigroup Status where
 instance Monoid Status where
   mempty = Clean
 
-cached :: (Eq i) => Build i i
-cached = cached' eq
+cacheEq :: (Eq i) => Build i i
+cacheEq = cached' eq
 
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
@@ -203,7 +203,7 @@ counter = Build $ do
 example :: IO ()
 example = do
   watch (pure ()) (putStrLn) $ proc inp -> do
-      cnt <- counter  <<< (retrigger 500) <<< log "after cache" <<< cached <<< counter <<< retrigger 2000 -< inp
+      cnt <- counter  <<< (retrigger 500) <<< log "after cache" <<< cacheEq <<< counter <<< retrigger 2000 -< inp
       r <- if even cnt
                      then retrigger 500 -< cnt
                      else returnA -< cnt
@@ -216,7 +216,7 @@ bail = shiftT $ \_cc -> pure ()
 -- example = do
 --     -- watch (pure "README.md") (BS.putStrLn) (readFile)
 --     watch (pure "deps.txt") (BS.putStrLn) $ proc inp -> do
---         deps <- (cached (tap <<< readFile)) -< inp
+--         deps <- (cacheEq (tap <<< readFile)) -< inp
 --         let depFiles = BS.unpack <$> BS.lines deps
 --         if length depFiles > 2 then readFile -< "README.md"
 --                                else retrigger 1000 <<< readFile -< "Changelog.md"

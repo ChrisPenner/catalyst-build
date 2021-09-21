@@ -26,6 +26,7 @@ source-repository head
 library
   exposed-modules:
       Catalyst.Build
+      Catalyst.Build.FileCache
   other-modules:
       Paths_catalyst_build
   hs-source-dirs:
@@ -38,13 +39,16 @@ library
     , catalyst
     , containers
     , directory
+    , fsnotify
     , indexed-traversable
     , mtl
     , profunctors
     , stm
+    , stm-containers
     , transformers
     , unix
     , unliftio
+    , unordered-containers
   default-language: Haskell2010
 
 executable catalyst-build-exe
@@ -63,13 +67,16 @@ executable catalyst-build-exe
     , catalyst-build
     , containers
     , directory
+    , fsnotify
     , indexed-traversable
     , mtl
     , profunctors
     , stm
+    , stm-containers
     , transformers
     , unix
     , unliftio
+    , unordered-containers
   default-language: Haskell2010
 
 test-suite catalyst-build-test
@@ -89,11 +96,14 @@ test-suite catalyst-build-test
     , catalyst-build
     , containers
     , directory
+    , fsnotify
     , indexed-traversable
     , mtl
     , profunctors
     , stm
+    , stm-containers
     , transformers
     , unix
     , unliftio
+    , unordered-containers
   default-language: Haskell2010

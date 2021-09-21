@@ -3,7 +3,21 @@
 # For more information, please see the documentation at:
 #   https://docs.haskellstack.org/en/stable/lock_files
 
-packages: []
+packages:
+- completed:
+    hackage: stm-containers-1.2@sha256:a887f2e7692b7cf20e0b081e2d66e21076e2bd4b57016ec59c484edfa2d29397,3244
+    pantry-tree:
+      size: 761
+      sha256: 20b1076bdb121347ccc512a67df697eed34815a8e35279b6b9a0951963b1eba2
+  original:
+    hackage: stm-containers-1.2@sha256:a887f2e7692b7cf20e0b081e2d66e21076e2bd4b57016ec59c484edfa2d29397,3244
+- completed:
+    hackage: stm-hamt-1.2.0.6@sha256:fba86ccb4b45c5706c19b0e1315ba63dcac3b5d71de945ec001ba921fae80061,3972
+    pantry-tree:
+      size: 1009
+      sha256: 1920790535af832b76e7583c33ecf51f8b0b0c3615ef1db1c8ed9be19622c1db
+  original:
+    hackage: stm-hamt-1.2.0.6@sha256:fba86ccb4b45c5706c19b0e1315ba63dcac3b5d71de945ec001ba921fae80061,3972
 snapshots:
 - completed:
     size: 586923

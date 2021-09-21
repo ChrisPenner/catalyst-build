@@ -24,6 +24,7 @@ dependencies:
 - mtl
 - transformers
 - containers
+- unordered-containers
 - bytestring
 - profunctors
 - catalyst
@@ -34,6 +35,8 @@ dependencies:
 - indexed-traversable
 - async
 - unliftio
+- fsnotify
+- stm-containers
 
 library:
   source-dirs: src
