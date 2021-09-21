@@ -26,6 +26,7 @@ import UnliftIO
 import UnliftIO.Concurrent
 import Control.Monad.Trans.Cont
 import Control.Monad.Reader
+import GHC.IORef (atomicModifyIORef')
 
 newtype Build i o =
     Build (IO (i -> ContT () IO o))
@@ -97,7 +98,7 @@ watch :: IO i -> (o -> IO ()) -> Build i o -> IO a
 watch readInput handler (Build setup) = do
     f <- setup
     forever $ do
-      i <- readInput 
+      i <- readInput
       runContT (f i) handler
 
     -- forever $ do
@@ -144,7 +145,7 @@ waitForChange a var = do
     a' <- readTVar var
     guard (a /= a')
 
--- fileWatch :: 
+-- fileWatch ::
 
 trackInput :: MonadIO m => s -> (i -> m (s, o)) -> IO (TVar (Maybe i), TVar s, i -> m o)
 trackInput def f = do
@@ -166,29 +167,26 @@ instance Semigroup Status where
 instance Monoid Status where
   mempty = Clean
 
--- cached :: (Eq i) => Build i o -> Build i o
--- cached = cached' eq
+cached :: (Eq i) => Build i o -> Build i o
+cached = cached' eq
 
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
--- cached' :: (i -> i -> Status) -> Build i o -> Build i o
--- cached' inputDiff (Build setup) = Build $ do
---     (ST checker, f) <- setup
---     (dirtify, ST checkDirty) <- newTrigger
---     lastRunRef <- newTVarIO Nothing
---     let inner i = do
---           let rerun = do o <- f i
---                          atomically $ writeTVar lastRunRef (Just (i, o))
---                          pure o
---           atomically (optional checkDirty) >>= \case
---             Just _ -> rerun
---             Nothing -> do
---               readTVarIO lastRunRef >>= \case
---                 Just (lastInput, o)
---                   | inputDiff lastInput i == Clean -> pure o
---                 _ -> rerun
---     pure (ST (checker *> dirtify), inner)
+cached' :: (i -> i -> Status) -> Build i o -> Build i o
+cached' inputDiff (Build setup) = Build $ do
+    f <- setup
+    lastRunRef <- newTVarIO Nothing
+    pure $ \i -> do
+        readTVarIO lastRunRef >>= \case
+          Just (lastInput, _)
+            | inputDiff lastInput i == Clean -> do
+                shiftT $ \_cc -> do
+                    pure ()
+          _ -> do
+              o <- f i
+              atomically $ writeTVar lastRunRef $ Just (i, o)
+              pure o
 
 waitJust :: TVar (Maybe a) -> STM a
 waitJust var = readTVar var >>= \case
@@ -211,12 +209,19 @@ debounced millis = Build $ do
           forever $ do
             liftIO . withAsync (cc i) $ \h -> do
                 race (wait h *> threadDelay (millis * 1000)) (threadDelay (millis * 1000))
-                
+
+counter :: Build i Int
+counter = Build $ do
+    nRef <- newTVarIO 0
+    pure $ \_ -> do
+        atomically $ do
+            modifyTVar nRef succ
+            readTVar nRef
 
 example :: IO ()
 example = do
   watch (pure "test") (putStrLn) $ proc inp -> do
-      returnA <<< debounced 2000 -< inp
+      returnA <<< cached (arrIO pure) <<< rmap show counter  <<< (debounced 2000) -< inp
 
 -- example :: IO ()
 -- example = do
