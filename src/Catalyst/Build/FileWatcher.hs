@@ -1,4 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
 module Catalyst.Build.FileWatcher where
 import System.FSNotify
 import qualified StmContainers.Map as STMMap

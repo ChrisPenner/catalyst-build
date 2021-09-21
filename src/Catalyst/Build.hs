@@ -13,24 +13,20 @@ import Control.Category ( Category )
 import Control.Monad
 import Control.Applicative
 import Data.Profunctor
-import qualified Data.ByteString.Char8 as BS
 import Data.Profunctor.Cayley
-import System.Posix.Files
 import Prelude hiding (readFile, log)
 import Control.Monad.State
-import Data.Function
-import Data.Traversable.WithIndex
-import qualified Data.Map as Map
 import Data.Maybe
 import UnliftIO
 import UnliftIO.Concurrent
 import Control.Monad.Trans.Cont
 import Control.Monad.Reader
-import GHC.IORef (atomicModifyIORef')
+import qualified Catalyst.Build.FileWatcher as FW
+import System.FSNotify
 
 newtype Build i o =
-    Build (IO (i -> ContT () IO o))
-    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli (ContT () IO)))
+    Build (IO (i -> ReaderT FW.FileWatcher (ContT () IO) o))
+    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli (ReaderT FW.FileWatcher (ContT () IO))))
 
 -- StatusTracker always tries to run each STM block,
 -- but will only succeed if at least one contained block succeeds.
@@ -89,10 +85,11 @@ instance ArrowChoice (Build) where
 -- -- TODO: properly accept input OR check env changes
 watch :: IO i -> (o -> IO ()) -> Build i o -> IO a
 watch readInput handler (Build setup) = do
-    f <- setup
-    forever $ do
-      i <- readInput
-      runContT (f i) handler
+    FW.withFileWatcher $ \fw -> do
+      f <- setup
+      forever $ do
+        i <- readInput
+        flip runContT handler . flip runReaderT fw $ f i
 
 arrIO :: (i -> IO o) -> Build i o
 arrIO f = Build (pure (liftIO . f))
@@ -160,10 +157,13 @@ cacheEq = cached' eq
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
+watchFile :: (MonadReader FW.FileWatcher m, MonadIO m) => FilePath -> (Event -> IO ()) -> m FW.StopWatching
+watchFile fp handler = ask >>= \fw -> liftIO (FW.watchFile fw fp handler)
+
 cached' :: (i -> i -> Status) -> Build i i
 cached' inputDiff = Build $ do
     lastRunRef <- newTVarIO Nothing
-    let rerun i = shiftT $ \cc -> do
+    let rerun i = lift . shiftT $ \cc -> do
                     ccAsync <- liftIO . async $ cc i
                     atomically $ writeTVar lastRunRef $ Just (i, ccAsync)
                     pure ()
@@ -187,7 +187,7 @@ type Millis = Int
 retrigger :: Millis -> Build i i
 retrigger millis = Build $ do
     pure $ \i -> do
-      shiftT $ \cc ->
+      lift . shiftT $ \cc ->
           forever $ do
             liftIO . withAsync (cc i) $ \h -> do
                 race (wait h *> threadDelay (millis * 1000)) (threadDelay (millis * 1000))
@@ -209,8 +209,8 @@ example = do
                      else returnA -< cnt
       arr show -< r
 
-bail :: ContT () IO a
-bail = shiftT $ \_cc -> pure ()
+bail :: MonadTrans t => t (ContT () IO) a
+bail = lift . shiftT $ \_cc -> pure ()
 
 -- example :: IO ()
 -- example = do
