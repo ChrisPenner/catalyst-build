@@ -30,7 +30,7 @@ import GHC.IORef (atomicModifyIORef')
 
 newtype Build i o =
     Build (IO (i -> ContT () IO o))
-    deriving (Category, Arrow, Profunctor, Strong) via (Cayley IO (Kleisli (ContT () IO)))
+    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli (ContT () IO)))
 
 -- StatusTracker always tries to run each STM block,
 -- but will only succeed if at least one contained block succeeds.
@@ -53,23 +53,16 @@ data LR = L | R
 -- -- The derived version is too greedy with regard to the Status check.
 -- instance Choice (Build) where
 --   left' (Build setup) = Build $ do
---       (ST envCheck, f) <- setup
---       dirRef <- newTVarIO L
+--       f <- setup
 --       let go = \case
 --                  Left a -> do
---                      atomically . writeTVar dirRef $ L
 --                      Left <$> f a
 --                  Right x -> do
---                      atomically $ writeTVar dirRef R
 --                      pure $ Right x
---       let newCheck = do
---             readTVar dirRef >>= \case
---               L -> envCheck
---               R -> retrySTM
---       pure $ (ST newCheck, go)
+--       pure $ go
 
--- instance ArrowChoice (Build) where
---   left = left'
+instance ArrowChoice (Build) where
+  left = left'
 
 -- -- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
 -- itraverse' :: (Show i, Ord i, TraversableWithIndex i t) => Build a b -> Build (t a) (t b)
@@ -100,16 +93,6 @@ watch readInput handler (Build setup) = do
     forever $ do
       i <- readInput
       runContT (f i) handler
-
-    -- forever $ do
-
-
---     (ST envCheck, f) <- liftIO setup
---     void (atomically readInput >>= f >>= handler)
---     forever $ do
---           threadDelay 500000
---           atomically envCheck -- wait for env changes
---           void (atomically readInput >>= f >>= handler)
 
 arrIO :: (i -> IO o) -> Build i o
 arrIO f = Build (pure (liftIO . f))
@@ -144,8 +127,6 @@ waitForChange :: Eq a => a -> TVar a -> STM ()
 waitForChange a var = do
     a' <- readTVar var
     guard (a /= a')
-
--- fileWatch ::
 
 trackInput :: MonadIO m => s -> (i -> m (s, o)) -> IO (TVar (Maybe i), TVar s, i -> m o)
 trackInput def f = do
@@ -193,17 +174,9 @@ waitJust var = readTVar var >>= \case
   Nothing -> retrySTM
   Just a -> pure a
 
--- static :: Build i o -> i -> Build () o
--- static (Build setup) i = Build $ do
---     (checker, f) <- setup
---     o <- f i
---     pure $ (checker, const $ pure o)
-
 type Millis = Int
-debounced :: Millis -> Build i i
-debounced millis = Build $ do
-    -- (trigger, st) <- newTrigger
-    -- void . forkIO . forever $ atomically trigger *> threadDelay (millis * 1000)
+retrigger :: Millis -> Build i i
+retrigger millis = Build $ do
     pure $ \i -> do
       shiftT $ \cc ->
           forever $ do
@@ -220,8 +193,12 @@ counter = Build $ do
 
 example :: IO ()
 example = do
-  watch (pure "test") (putStrLn) $ proc inp -> do
-      returnA <<< cached (arrIO pure) <<< rmap show counter  <<< (debounced 2000) -< inp
+  watch (pure ()) (putStrLn) $ proc inp -> do
+      cnt <- counter  <<< (retrigger 2000) -< inp
+      r <- if even cnt
+                     then retrigger 500 -< cnt
+                     else returnA -< cnt
+      arr show -< r
 
 -- example :: IO ()
 -- example = do
@@ -230,7 +207,7 @@ example = do
 --         deps <- (cached (tap <<< readFile)) -< inp
 --         let depFiles = BS.unpack <$> BS.lines deps
 --         if length depFiles > 2 then readFile -< "README.md"
---                                else debounced 1000 <<< readFile -< "Changelog.md"
+--                                else retrigger 1000 <<< readFile -< "Changelog.md"
 --         -- itraverse' readFile -< Map.fromList ((\x -> (x, x)) <$> depFiles)
 --   where
 --     printFile = \name f -> do
