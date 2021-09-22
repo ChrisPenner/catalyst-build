@@ -26,7 +26,7 @@ source-repository head
 library
   exposed-modules:
       Catalyst.Build
-      Catalyst.Build.FileCache
+      Catalyst.Build.FileWatcher
   other-modules:
       Paths_catalyst_build
   hs-source-dirs:

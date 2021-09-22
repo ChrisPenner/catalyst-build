@@ -192,8 +192,6 @@ watchFiles :: Build [FilePath] [FilePath]
 watchFiles = Build $ do
   lastFilesRef <- newTVarIO HM.empty
   (trigger, waiter) <- newTrigger
-  let (Build setup') = retriggerOn (pure ()) (const waiter)
-  retriggerer <- setup'
   let inner = \fs -> do
         lastFilesMap <- readTVarIO lastFilesRef
         currentFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
@@ -209,7 +207,7 @@ watchFiles = Build $ do
         liftIO $ fold newlyRemoved
         atomically $ writeTVar lastFilesRef currentFilesMap
         pure fs
-  pure (inner >=> retriggerer)
+  pure (inner >=> retriggerOn waiter)
 
 cached' :: (i -> i -> Status) -> Build i i
 cached' inputDiff = Build $ do
@@ -236,17 +234,14 @@ waitJust var = readTVar var >>= \case
 
 type Millis = Int
 ticker :: Millis -> Build i i
-ticker millis =
-  retriggerOn (pure ()) $ const (threadDelay (millis * 1000))
+ticker millis = Build $ do
+  pure $ retriggerOn (threadDelay (millis * 1000))
 
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: IO s -> (s -> IO ()) -> Build i i
-retriggerOn setup buildWaiter = Build $ do
-  s <- setup
-  let waiter = buildWaiter s
-  pure $ \i -> lift . shiftT $ \cc ->
+retriggerOn :: IO a -> (i -> t (ContT () IO) i)
+retriggerOn waiter i = lift . shiftT $ \cc ->
     liftIO . forever $ do
       withAsync (cc i) $ \_ -> do
         waiter
