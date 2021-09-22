@@ -23,6 +23,12 @@ import Control.Monad.Trans.Cont
 import Control.Monad.Reader
 import qualified Catalyst.Build.FileWatcher as FW
 import System.FSNotify
+import qualified Data.HashMap.Strict as HM
+import System.Directory
+import Data.Traversable
+import Data.Function
+import Data.Foldable
+import qualified Data.ByteString.Char8 as BS
 
 newtype Build i o =
     Build (IO (i -> ReaderT FW.FileWatcher (ContT () IO) o))
@@ -121,10 +127,13 @@ tap f = arrIO $ \a -> f a *> pure a
 --                             else pure ()
 --     pure $ (st, go)
 
-newTrigger :: IO (STM (), StatusTracker)
+-- Returns a new (trigger, waiter) pair.
+-- The waiter will block until the trigger is executed.
+-- The waiter should be called only once at a time.
+newTrigger :: IO (IO (), IO ())
 newTrigger = do
     var <- newTVarIO False
-    pure (writeTVar var True, ST ((readTVar var >>= guard) <* writeTVar var False))
+    pure (atomically $ writeTVar var True, atomically ((readTVar var >>= guard) <* writeTVar var False))
 
 waitForChange :: Eq a => a -> TVar a -> STM ()
 waitForChange a var = do
@@ -157,8 +166,47 @@ cacheEq = cached' eq
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
-watchFile :: (MonadReader FW.FileWatcher m, MonadIO m) => FilePath -> (Event -> IO ()) -> m FW.StopWatching
-watchFile fp handler = ask >>= \fw -> liftIO (FW.watchFile fw fp handler)
+watchFileHelper :: (MonadReader FW.FileWatcher m, MonadIO m) => FilePath -> (Event -> IO ()) -> m FW.StopWatching
+watchFileHelper fp handler = ask >>= \fw -> liftIO (FW.watchFile fw fp handler)
+
+-- watchFiles :: Build [FilePath] [FilePath]
+-- watchFiles = Build $ do
+--   lastFilesRef <- newTVarIO HM.empty
+--   pure $ \fs -> do
+--       lastFilesMap <- readTVarIO lastFilesRef
+--       newLastFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
+--           absPath <- liftIO $ makeAbsolute path
+--           HM.lookup absPath lastFilesMap & \case
+--             Nothing -> do
+--                 cancelWatch <- watchFileHelper path . const $ _forceRerun
+--                 modify (HM.insert absPath cancelWatch)
+--             Just _ -> pure ()
+--       let newlyRemoved = HM.difference lastFilesMap newLastFilesMap
+--       -- Stop watching all files we no longer care about.
+--       liftIO $ fold newlyRemoved
+--       atomically $ writeTVar lastFilesRef newLastFilesMap
+--       pure fs
+
+watchFiles :: Build [FilePath] [FilePath]
+watchFiles = Build $ do
+  lastFilesRef <- newTVarIO HM.empty
+  (trigger, waiter) <- newTrigger
+  let (Build setup') = retriggerOn (pure ()) (const waiter)
+  retriggerer <- setup'
+  pure $ retriggerer >=> \fs -> do
+      lastFilesMap <- readTVarIO lastFilesRef
+      newLastFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
+          absPath <- liftIO $ makeAbsolute path
+          HM.lookup absPath lastFilesMap & \case
+            Nothing -> do
+                cancelWatch <- watchFileHelper path . const $ trigger
+                modify (HM.insert absPath cancelWatch)
+            Just _ -> pure ()
+      let newlyRemoved = HM.difference lastFilesMap newLastFilesMap
+      -- Stop watching all files we no longer care about.
+      liftIO $ fold newlyRemoved
+      atomically $ writeTVar lastFilesRef newLastFilesMap
+      pure fs
 
 cached' :: (i -> i -> Status) -> Build i i
 cached' inputDiff = Build $ do
@@ -184,14 +232,26 @@ waitJust var = readTVar var >>= \case
   Just a -> pure a
 
 type Millis = Int
-retrigger :: Millis -> Build i i
-retrigger millis = Build $ do
-    pure $ \i -> do
-      lift . shiftT $ \cc ->
-          forever $ do
-            liftIO . withAsync (cc i) $ \h -> do
-                race (wait h *> threadDelay (millis * 1000)) (threadDelay (millis * 1000))
+ticker :: Millis -> Build i i
+ticker millis =
+  retriggerOn (pure ()) $ const (threadDelay (millis * 1000))
 
+-- |  After an initial run of a full build, this combinator will trigger a re-build
+-- of all downstream dependents each time the given a trigger resolves.
+-- The trigger should *block* until its condition has been fulfilled.
+retriggerOn :: IO s -> (s -> IO ()) -> Build i i
+retriggerOn setup buildWaiter = Build $ do
+  s <- setup
+  let waiter = buildWaiter s
+  pure $ \i -> lift . shiftT $ \cc ->
+    liftIO . forever $ do
+      ccA <- (async $ cc i)
+      trigA <- (async $ waiter)
+      waitEither ccA trigA >>= \case
+        Left _ -> wait trigA
+        Right _ -> pure ()
+
+-- | counter keeps track of how many times it has been retriggered.
 counter :: Build i Int
 counter = Build $ do
     nRef <- newTVarIO 0
@@ -200,12 +260,17 @@ counter = Build $ do
             modifyTVar nRef succ
             readTVar nRef
 
-example :: IO ()
-example = do
+exampleFileWatch :: IO ()
+exampleFileWatch = do
+  watch (pure "README.md") (print) $ proc inp -> do
+    watchFiles -< pure inp
+
+exampleTickerCache :: IO ()
+exampleTickerCache = do
   watch (pure ()) (putStrLn) $ proc inp -> do
-      cnt <- counter  <<< (retrigger 500) <<< log "after cache" <<< cacheEq <<< counter <<< retrigger 2000 -< inp
+      cnt <- counter  <<< (ticker 500) <<< log "after cache" <<< cacheEq <<< counter <<< ticker 2000 -< inp
       r <- if even cnt
-                     then retrigger 500 -< cnt
+                     then ticker 500 -< cnt
                      else returnA -< cnt
       arr show -< r
 
@@ -219,9 +284,5 @@ bail = lift . shiftT $ \_cc -> pure ()
 --         deps <- (cacheEq (tap <<< readFile)) -< inp
 --         let depFiles = BS.unpack <$> BS.lines deps
 --         if length depFiles > 2 then readFile -< "README.md"
---                                else retrigger 1000 <<< readFile -< "Changelog.md"
+--                                else ticker 1000 <<< readFile -< "Changelog.md"
 --         -- itraverse' readFile -< Map.fromList ((\x -> (x, x)) <$> depFiles)
---   where
---     printFile = \name f -> do
---         BS.putStrLn (BS.pack name <> "===================")
---         BS.putStrLn f
