@@ -31,7 +31,6 @@ import Data.Foldable
 import qualified Data.ByteString.Char8 as BS
 import Data.Profunctor
 import Data.Traversable.WithIndex
-import qualified Data.Map as Map
 import qualified StmContainers.Map as StmMap
 import Data.Hashable
 import Data.Functor.WithIndex
@@ -105,12 +104,12 @@ peekCVar (CVar v) = do
     Just (a, _) -> pure a
     _ -> retrySTM
 
--- It's possible to write version of this with only an Ord constraint, just haven't done it yet. 
+-- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
 itraversed :: forall i t a b. (Hashable i, TraversableWithIndex i t, Eq i) => Build a b -> Build (t a) (t b)
 itraversed f = lmap (imap (,)) (traversedWithKey fst (lmap snd f))
 
--- It's possible to write version of this with only an Ord constraint, just haven't done it yet. 
+-- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
 traversedWithKey :: forall k t a b. (Hashable k, Eq k, Traversable t) => (a -> k) -> Build a b -> Build (t a) (t b)
 traversedWithKey getKey (Build setup) = Build $ do
@@ -151,20 +150,61 @@ log s = tap (const $ putStrLn s)
 tap :: (a -> IO b) -> Build a a
 tap f = arrIO $ \a -> f a *> pure a
 
--- fileModified :: Build FilePath FilePath
--- fileModified = Build $ do
---     (trigger, st) <- newTrigger
---     (fpRef, tRef, go) <- trackInput 0 $ \fp -> do
---         t <- modificationTime <$> liftIO (getFileStatus fp)
---         pure (t, fp)
---     void . forkIO . forever $ do
---         threadDelay 500000
---         fp <- atomically $ readTVar fpRef >>= maybe retrySTM pure
---         lastT <- readTVarIO tRef
---         currentT <- modificationTime <$> liftIO (getFileStatus fp)
---         if currentT > lastT then atomically (writeTVar tRef currentT >> trigger)
---                             else pure ()
---     pure $ (st, go)
+cachedEq :: Eq i => Build i o -> Build i o
+cachedEq = cachedOn id
+
+cachedOn :: Eq a => (i -> a) -> Build i o -> Build i o
+cachedOn project = cachedBy (eq `on` project)
+
+cachedBy :: (i -> i -> Status) -> Build i o -> Build i o
+cachedBy comp (Build setup) = Build $ do
+  go <- setup
+  lastRunInput <- newTVarIO Nothing
+  lastRunOutput <- newTVarIO Nothing
+  let rerun i = do
+        o <- go i
+        liftIO $ atomically $ do
+          writeTVar lastRunInput (Just i)
+          writeTVar lastRunOutput (Just o)
+        pure o
+  pure $ \i -> do
+    readTVarIO lastRunInput >>= \case
+      Nothing -> do
+        rerun i
+      Just lastI -> do
+        mo <- readTVarIO lastRunOutput
+        case (comp lastI i, mo) of
+          (Clean, Just o) -> pure o
+          _ -> rerun i
+
+cutEq :: Eq i => Build i i
+cutEq = cutOn id
+
+cutOn :: Eq a => (i -> a) -> Build i i
+cutOn project = cutBy (eq `on` project)
+
+-- Don't retrigger the continuation unless the input has meaningfully changed.
+-- Leaves the old continuation running in the background.
+cutBy :: (i -> i -> Status) -> Build i i
+cutBy comp = Build $ do
+  lastRunInput <- newTVarIO Nothing
+  lastRunRef <- newTVarIO Nothing
+  let rerun i = do
+        atomically $ writeTVar lastRunInput (Just i)
+        -- Cancel any existing run
+        readTVarIO lastRunRef >>= maybe (pure ()) cancel
+        lift . shiftT $ \cc -> do
+          -- TODO: add some masked sections here for exception safety.
+          ref <- liftIO $ async (cc i)
+          atomically $ writeTVar lastRunRef (Just ref)
+  pure $ \i -> do
+    readTVarIO lastRunInput >>= \case
+      Nothing -> do
+        rerun i
+      Just lastI -> do
+        case comp lastI i of
+          Clean -> bail
+          _ -> rerun i
 
 -- Returns a new (trigger, waiter) pair.
 -- The waiter will block until the trigger is executed.
@@ -199,9 +239,6 @@ instance Semigroup Status where
 instance Monoid Status where
   mempty = Clean
 
-cacheEq :: (Eq i) => Build i i
-cacheEq = cached' eq
-
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
@@ -226,25 +263,8 @@ watchFiles = Build $ do
         liftIO . print $ "Current files to watch: " <> show (HM.keys currentFilesMap)
         liftIO $ fold newlyRemoved
         atomically $ writeTVar lastFilesRef currentFilesMap
-        retriggerOn waiter
+        retriggerOn () waiter
         pure fs
-
-cached' :: (i -> i -> Status) -> Build i i
-cached' inputDiff = Build $ do
-    lastRunRef <- newTVarIO Nothing
-    let rerun i = lift . shiftT $ \cc -> do
-                    ccAsync <- liftIO . async $ cc i
-                    atomically $ writeTVar lastRunRef $ Just (i, ccAsync)
-    pure $ \i -> do
-        readTVarIO lastRunRef >>= \case
-          Just (lastInput, lastCC)
-            | inputDiff lastInput i == Clean -> do
-                -- We can leave the previous continuation running in the async
-                bail
-            | otherwise -> do
-                cancel lastCC
-                rerun i
-          Nothing -> rerun i
 
 waitJust :: TVar (Maybe a) -> STM a
 waitJust var = readTVar var >>= \case
@@ -254,19 +274,17 @@ waitJust var = readTVar var >>= \case
 type Millis = Int
 ticker :: Millis -> Build i i
 ticker millis = Build $ do
-  pure $ \i -> retriggerOn (threadDelay (millis * 1000)) *> pure i
+  pure $ \i -> retriggerOn () (threadDelay (millis * 1000)) *> pure i
 
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: IO a -> BuildM ()
-retriggerOn waiter = lift . shiftT $ \cc ->
-    liftIO . forever $ do
-      -- ccA <- async (cc i)
-      -- void waiter
-      -- cancel ccA
-      withAsync (cc ()) $ \_ -> do
-        void waiter
+retriggerOn :: a -> IO a -> BuildM a
+retriggerOn fstA waiter = lift . shiftT $ \cc -> do
+  let looper a = do
+         nextA <- withAsync (cc a) $ const waiter
+         looper nextA
+  liftIO $ looper fstA
 
 -- Never is a build-step which NEVER calls its continuation, and never completes
 never :: Build i x
@@ -316,12 +334,13 @@ onInterrupts go cleanup = do
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
-  watch (pure ()) (putStrLn) $ proc inp -> do
-      cnt <- counter <<< (ticker 500) <<< log "after cache" <<< cacheEq <<< counter <<< ticker 2000 -< inp
-      r <- if even cnt
-                     then ticker 500 -< cnt
-                     else returnA -< cnt
-      arr show -< r
+  watch (pure ()) (print) $ proc inp -> do
+      cachedEq (counter <<< log "inside cache") <<< ticker 300 <<< counter <<< ticker 2000 -< inp
+
+exampleTickerCut :: IO ()
+exampleTickerCut = do
+  watch (pure ()) (print) $ proc inp -> do
+      log "after cache" <<< cutEq <<< ticker 100 <<< counter <<< ticker 3000 -< inp
 
 exampleStrong :: IO ()
 exampleStrong = do
@@ -331,10 +350,10 @@ exampleStrong = do
 exampleTraversed :: IO ()
 exampleTraversed = do
   watch (pure [1, 2, 3, 4]) (print) $ proc inp -> do
-    itraverse' trace <<< arr (\x -> replicate x x) <<< counter <<< ticker 1000 -< inp
+    itraversed trace <<< arr (\x -> replicate x x) <<< counter <<< ticker 1000 -< inp
 
 example :: IO ()
-example = exampleTraversed
+example = exampleTickerCut
 
 bail :: MonadTrans t => t (ContT () IO) a
 bail = lift . shiftT $ \_cc -> pure ()
