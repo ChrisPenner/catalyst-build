@@ -34,6 +34,7 @@ import Data.Traversable.WithIndex
 import qualified Data.Map as Map
 import qualified StmContainers.Map as StmMap
 import Data.Hashable
+import Data.Functor.WithIndex
 
 newtype Build i o =
     Build (IO (i -> BuildM o))
@@ -104,17 +105,24 @@ peekCVar (CVar v) = do
     Just (a, _) -> pure a
     _ -> retrySTM
 
-itraverse' :: forall i t a b. (Show i, Hashable i, TraversableWithIndex i t, Eq i) => Build a b -> Build (t a) (t b)
-itraverse' (Build setup) = Build $ do
+-- It's possible to write version of this with only an Ord constraint, just haven't done it yet. 
+-- It would add more lock contention
+itraversed :: forall i t a b. (Hashable i, TraversableWithIndex i t, Eq i) => Build a b -> Build (t a) (t b)
+itraversed f = lmap (imap (,)) (traversedWithKey fst (lmap snd f))
+
+-- It's possible to write version of this with only an Ord constraint, just haven't done it yet. 
+-- It would add more lock contention
+traversedWithKey :: forall k t a b. (Hashable k, Eq k, Traversable t) => (a -> k) -> Build a b -> Build (t a) (t b)
+traversedWithKey getKey (Build setup) = Build $ do
     stashRef <- StmMap.newIO
     pure $ \xs -> do
          -- Initialize and run all setups concurrently
-         runParBuild . ifor xs $ \i x -> ParBuild $ do
-           atomically (StmMap.lookup i stashRef) >>= \case
+         runParBuild . for xs $ \x -> ParBuild $ do
+           let key = getKey x
+           atomically (StmMap.lookup key stashRef) >>= \case
              Nothing -> do
                f <- liftIO setup
-               liftIO . print $ "initializing " <> show i
-               atomically (StmMap.insert f i stashRef)
+               atomically (StmMap.insert f key stashRef)
                f x
              Just f -> do
                f x
@@ -199,24 +207,6 @@ eq a b = if a == b then Clean else Dirty
 
 watchFileHelper :: (MonadReader FW.FileWatcher m, MonadIO m) => FilePath -> (Event -> IO ()) -> m FW.StopWatching
 watchFileHelper fp handler = ask >>= \fw -> liftIO (FW.watchFile fw fp handler)
-
--- watchFiles :: Build [FilePath] [FilePath]
--- watchFiles = Build $ do
---   lastFilesRef <- newTVarIO HM.empty
---   pure $ \fs -> do
---       lastFilesMap <- readTVarIO lastFilesRef
---       newLastFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
---           absPath <- liftIO $ makeAbsolute path
---           HM.lookup absPath lastFilesMap & \case
---             Nothing -> do
---                 cancelWatch <- watchFileHelper path . const $ _forceRerun
---                 modify (HM.insert absPath cancelWatch)
---             Just _ -> pure ()
---       let newlyRemoved = HM.difference lastFilesMap newLastFilesMap
---       -- Stop watching all files we no longer care about.
---       liftIO $ fold newlyRemoved
---       atomically $ writeTVar lastFilesRef newLastFilesMap
---       pure fs
 
 watchFiles :: Build [FilePath] [FilePath]
 watchFiles = Build $ do
