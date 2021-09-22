@@ -17,7 +17,6 @@ import Data.Profunctor
 import Data.Profunctor.Cayley
 import Prelude hiding (readFile, log)
 import Control.Monad.State
-import Data.Maybe
 import UnliftIO
 import UnliftIO.Concurrent
 import Control.Monad.Trans.Cont
@@ -32,26 +31,17 @@ import Data.Foldable
 import qualified Data.ByteString.Char8 as BS
 
 newtype Build i o =
-    Build (IO (i -> ReaderT FW.FileWatcher (ContT () IO) o))
-    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli (ReaderT FW.FileWatcher (ContT () IO))))
+    Build (IO (i -> BuildM o))
+    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli BuildM))
 
--- StatusTracker always tries to run each STM block,
--- but will only succeed if at least one contained block succeeds.
--- This allows arrows to "clear" their own status variables when they succeed
--- and prevents multiple redundant re-runs.
-newtype StatusTracker = ST { runStatusTracker :: STM () }
-instance Semigroup StatusTracker where
-  ST l <> ST r = ST $ do
-    l' <- optional l
-    r' <- optional r
-    if isNothing l' && isNothing r' then retrySTM
-                                    else pure ()
+type BuildM = (ReaderT FW.FileWatcher (ContT () IO))
 
-instance Monoid StatusTracker where
-  mempty = ST retrySTM
+data BuildInvalidated = BuildInvalidated
+  deriving Show
+instance Exception BuildInvalidated where
 
-data LR = L | R
-  deriving (Eq)
+-- data LR = L | R
+--   deriving (Eq)
 
 -- -- The derived version is too greedy with regard to the Status check.
 -- instance Choice (Build) where
@@ -242,8 +232,11 @@ ticker millis = Build $ do
 retriggerOn :: MonadTrans t => IO a -> (i -> t (ContT () IO) i)
 retriggerOn waiter i = lift . shiftT $ \cc ->
     liftIO . forever $ do
+      -- ccA <- async (cc i)
+      -- void waiter
+      -- cancel ccA
       withAsync (cc i) $ \_ -> do
-        waiter
+        void waiter
 
 -- | counter keeps track of how many times it has been retriggered.
 counter :: Build i Int
@@ -257,11 +250,22 @@ counter = Build $ do
 exampleFileWatch :: IO ()
 exampleFileWatch = do
   watch (pure ["deps.txt"]) (print) $ proc inp -> do
-    deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< watchFiles -< inp
+    deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< clever "*** Shallow" <<< watchFiles -< inp
     let depFiles = BS.unpack <$> BS.lines deps
     -- if length depFiles > 2 then readFile -< "README.md"
     --                        else ticker 1000 <<< readFile -< "Changelog.md"
-    log "DEPS:" <<< watchFiles -< depFiles
+    log "DEPS:" <<< ticker 1000 <<< clever "*** Deepest" <<< watchFiles <<< clever "*** Deep" -< depFiles
+
+clever :: String -> Build i i
+clever s = Build $ do
+  pure $ \i -> do
+    onInterrupt $ print s
+    pure i
+
+onInterrupt :: IO a -> BuildM ()
+onInterrupt cleanup = do
+  lift . shiftT $ \cc -> do
+    lift $ onException (cc ()) cleanup
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
