@@ -215,7 +215,6 @@ cached' inputDiff = Build $ do
     let rerun i = lift . shiftT $ \cc -> do
                     ccAsync <- liftIO . async $ cc i
                     atomically $ writeTVar lastRunRef $ Just (i, ccAsync)
-                    pure ()
     pure $ \i -> do
         readTVarIO lastRunRef >>= \case
           Just (lastInput, lastCC)
@@ -240,7 +239,7 @@ ticker millis = Build $ do
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: IO a -> (i -> t (ContT () IO) i)
+retriggerOn :: MonadTrans t => IO a -> (i -> t (ContT () IO) i)
 retriggerOn waiter i = lift . shiftT $ \cc ->
     liftIO . forever $ do
       withAsync (cc i) $ \_ -> do
