@@ -8,6 +8,7 @@
 {-# LANGUAGE Arrows #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Catalyst.Build where
 import Control.Arrow
 import Control.Category ( Category )
@@ -32,7 +33,7 @@ import qualified Data.ByteString.Char8 as BS
 
 newtype Build i o =
     Build (IO (i -> BuildM o))
-    deriving (Category, Arrow, Profunctor, Strong, Choice) via (Cayley IO (Kleisli BuildM))
+    deriving (Category, Profunctor, Strong, Choice, ArrowChoice) via (Cayley IO (Kleisli BuildM))
 
 type BuildM = (ReaderT FW.FileWatcher (ContT () IO))
 
@@ -40,22 +41,57 @@ data BuildInvalidated = BuildInvalidated
   deriving Show
 instance Exception BuildInvalidated where
 
--- data LR = L | R
---   deriving (Eq)
+instance Arrow Build where
+  arr f = Build $ pure (pure . f)
+  Build setupL *** Build setupR = Build $ do
+    (lf, rf) <- concurrently setupL setupR
+    pure $ \(l, r) -> do
+      par2 (,) (lf l) (rf r)
 
--- -- The derived version is too greedy with regard to the Status check.
--- instance Choice (Build) where
---   left' (Build setup) = Build $ do
---       f <- setup
---       let go = \case
---                  Left a -> do
---                      Left <$> f a
---                  Right x -> do
---                      pure $ Right x
---       pure $ go
+par2 :: forall a b c. (a -> b -> c) -> BuildM a -> BuildM b -> BuildM c
+par2 f l r = do
+  lVar <- newEmptyCVarIO
+  rVar <- newEmptyCVarIO
+  fm <- ask
+  let ioL :: IO () = flip runContT (atomically . putCVar lVar) . flip runReaderT fm $ l
+  let ioR :: IO () = flip runContT (atomically . putCVar rVar) . flip runReaderT fm $ r
+  -- This blocks until we have a new result from EITHER side
+  let waitNext = atomically $ do
+                   liftA2 f (waitCVar lVar) (waitCVar rVar)
+                     <|> liftA2 f (waitCVar lVar) (peekCVar rVar)
+                     <|> liftA2 f (peekCVar lVar) (waitCVar rVar)
+  -- capture downstream continuation
+  lift . shiftT $ \cc -> do
+    -- Kick off each side of the computation
+    liftIO $ withAsync ioL . const . withAsync ioR . const $ do
+        -- This runs the continuatin until a change is detected on one of our sides
+        let looper res = do
+              nextRes <- withAsync (cc res) $ \_ -> waitNext
+              looper nextRes
+        -- Wait for a first result from both sides before we can start the loop.
+        waitNext >>= looper
 
-instance ArrowChoice (Build) where
-  left = left'
+newtype CVar a = CVar (TVar (Maybe (a, Bool)))
+
+newEmptyCVarIO :: MonadIO m => m (CVar a)
+newEmptyCVarIO = CVar <$> newTVarIO Nothing
+
+putCVar :: CVar a -> a -> STM ()
+putCVar (CVar v) a = writeTVar v $ Just (a, True)
+
+-- Only ONE listener will consume each change to a CVar.
+waitCVar :: CVar a -> STM a
+waitCVar (CVar v) = do
+  readTVar v >>= \case
+    Just (a, True) -> writeTVar v (Just (a, False)) *> pure a
+    _ -> retrySTM
+
+-- | peek at the value in a CVar regardless of changes, don't consume changes if they exist.
+peekCVar :: CVar a -> STM a
+peekCVar (CVar v) = do
+  readTVar v >>= \case
+    Just (a, _) -> pure a
+    _ -> retrySTM
 
 -- -- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
 -- itraverse' :: (Show i, Ord i, TraversableWithIndex i t) => Build a b -> Build (t a) (t b)
@@ -182,7 +218,7 @@ watchFiles :: Build [FilePath] [FilePath]
 watchFiles = Build $ do
   lastFilesRef <- newTVarIO HM.empty
   (trigger, waiter) <- newTrigger
-  let inner = \fs -> do
+  pure $ \fs -> do
         lastFilesMap <- readTVarIO lastFilesRef
         currentFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
             absPath <- liftIO $ makeAbsolute path
@@ -196,8 +232,8 @@ watchFiles = Build $ do
         liftIO . print $ "Current files to watch: " <> show (HM.keys currentFilesMap)
         liftIO $ fold newlyRemoved
         atomically $ writeTVar lastFilesRef currentFilesMap
+        retriggerOn waiter
         pure fs
-  pure (inner >=> retriggerOn waiter)
 
 cached' :: (i -> i -> Status) -> Build i i
 cached' inputDiff = Build $ do
@@ -224,19 +260,24 @@ waitJust var = readTVar var >>= \case
 type Millis = Int
 ticker :: Millis -> Build i i
 ticker millis = Build $ do
-  pure $ retriggerOn (threadDelay (millis * 1000))
+  pure $ \i -> retriggerOn (threadDelay (millis * 1000)) *> pure i
 
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: MonadTrans t => IO a -> (i -> t (ContT () IO) i)
-retriggerOn waiter i = lift . shiftT $ \cc ->
+retriggerOn :: IO a -> BuildM ()
+retriggerOn waiter = lift . shiftT $ \cc ->
     liftIO . forever $ do
       -- ccA <- async (cc i)
       -- void waiter
       -- cancel ccA
-      withAsync (cc i) $ \_ -> do
+      withAsync (cc ()) $ \_ -> do
         void waiter
+
+-- Never is a build-step which NEVER calls its continuation, and never completes
+never :: Build i x
+never = Build $ do
+  pure $ \_ -> forever $ threadDelay 1000000000
 
 -- | counter keeps track of how many times it has been retriggered.
 counter :: Build i Int
@@ -282,14 +323,20 @@ onInterrupts go cleanup = do
 exampleTickerCache :: IO ()
 exampleTickerCache = do
   watch (pure ()) (putStrLn) $ proc inp -> do
-      cnt <- counter  <<< (ticker 500) <<< log "after cache" <<< cacheEq <<< counter <<< ticker 2000 -< inp
+      cnt <- counter <<< (ticker 500) <<< log "after cache" <<< cacheEq <<< counter <<< ticker 2000 -< inp
       r <- if even cnt
                      then ticker 500 -< cnt
                      else returnA -< cnt
       arr show -< r
 
+exampleStrong :: IO ()
+exampleStrong = do
+  watch (pure ((),())) (print) $ proc inp -> do
+    counter <<< never <<< log "JOIN" <<< (log "LEFT" <<< watchFiles <<< arr (const ["ChangeLog.md"])) *** (log "RIGHT" <<< watchFiles <<< arr (const ["README.md"])) -< inp
+
+
 example :: IO ()
-example = exampleFileWatch
+example = exampleStrong
 
 bail :: MonadTrans t => t (ContT () IO) a
 bail = lift . shiftT $ \_cc -> pure ()
