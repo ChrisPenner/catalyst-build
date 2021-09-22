@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DerivingVia #-}
@@ -193,20 +194,22 @@ watchFiles = Build $ do
   (trigger, waiter) <- newTrigger
   let (Build setup') = retriggerOn (pure ()) (const waiter)
   retriggerer <- setup'
-  pure $ retriggerer >=> \fs -> do
-      lastFilesMap <- readTVarIO lastFilesRef
-      newLastFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
-          absPath <- liftIO $ makeAbsolute path
-          HM.lookup absPath lastFilesMap & \case
-            Nothing -> do
-                cancelWatch <- watchFileHelper path . const $ trigger
-                modify (HM.insert absPath cancelWatch)
-            Just _ -> pure ()
-      let newlyRemoved = HM.difference lastFilesMap newLastFilesMap
-      -- Stop watching all files we no longer care about.
-      liftIO $ fold newlyRemoved
-      atomically $ writeTVar lastFilesRef newLastFilesMap
-      pure fs
+  let inner = \fs -> do
+        lastFilesMap <- readTVarIO lastFilesRef
+        currentFilesMap <- flip execStateT HM.empty $ for fs $ \path -> do
+            absPath <- liftIO $ makeAbsolute path
+            HM.lookup absPath lastFilesMap & \case
+              Nothing -> do
+                  cancelWatch <- watchFileHelper absPath . const $ trigger
+                  modify (HM.insert absPath cancelWatch)
+              Just canceller -> modify (HM.insert absPath canceller)
+        let newlyRemoved = HM.difference lastFilesMap currentFilesMap
+        -- Stop watching all files we no longer care about.
+        liftIO . print $ "Current files to watch: " <> show (HM.keys currentFilesMap)
+        liftIO $ fold newlyRemoved
+        atomically $ writeTVar lastFilesRef currentFilesMap
+        pure fs
+  pure (inner >=> retriggerer)
 
 cached' :: (i -> i -> Status) -> Build i i
 cached' inputDiff = Build $ do
@@ -245,11 +248,8 @@ retriggerOn setup buildWaiter = Build $ do
   let waiter = buildWaiter s
   pure $ \i -> lift . shiftT $ \cc ->
     liftIO . forever $ do
-      ccA <- (async $ cc i)
-      trigA <- (async $ waiter)
-      waitEither ccA trigA >>= \case
-        Left _ -> wait trigA
-        Right _ -> pure ()
+      withAsync (cc i) $ \_ -> do
+        waiter
 
 -- | counter keeps track of how many times it has been retriggered.
 counter :: Build i Int
@@ -262,8 +262,12 @@ counter = Build $ do
 
 exampleFileWatch :: IO ()
 exampleFileWatch = do
-  watch (pure "README.md") (print) $ proc inp -> do
-    watchFiles -< pure inp
+  watch (pure ["deps.txt"]) (print) $ proc inp -> do
+    deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< watchFiles -< inp
+    let depFiles = BS.unpack <$> BS.lines deps
+    -- if length depFiles > 2 then readFile -< "README.md"
+    --                        else ticker 1000 <<< readFile -< "Changelog.md"
+    log "DEPS:" <<< watchFiles -< depFiles
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
@@ -273,6 +277,9 @@ exampleTickerCache = do
                      then ticker 500 -< cnt
                      else returnA -< cnt
       arr show -< r
+
+example :: IO ()
+example = exampleFileWatch
 
 bail :: MonadTrans t => t (ContT () IO) a
 bail = lift . shiftT $ \_cc -> pure ()
