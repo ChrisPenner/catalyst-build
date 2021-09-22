@@ -13,8 +13,7 @@ module Catalyst.Build where
 import Control.Arrow
 import Control.Category ( Category )
 import Control.Monad
-import Control.Applicative
-import Data.Profunctor
+import Control.Applicative hiding (WrappedArrow)
 import Data.Profunctor.Cayley
 import Prelude hiding (readFile, log)
 import Control.Monad.State
@@ -30,12 +29,24 @@ import Data.Traversable
 import Data.Function
 import Data.Foldable
 import qualified Data.ByteString.Char8 as BS
+import Data.Profunctor
+import Data.Traversable.WithIndex
+import qualified Data.Map as Map
+import qualified StmContainers.Map as StmMap
+import Data.Hashable
 
 newtype Build i o =
     Build (IO (i -> BuildM o))
-    deriving (Category, Profunctor, Strong, Choice, ArrowChoice) via (Cayley IO (Kleisli BuildM))
+    deriving (Profunctor, Category, ArrowChoice) via (Cayley IO (Kleisli BuildM))
+    deriving (Strong, Choice) via WrappedArrow Build
 
 type BuildM = (ReaderT FW.FileWatcher (ContT () IO))
+newtype ParBuild a = ParBuild { runParBuild :: ReaderT FW.FileWatcher (ContT () IO) a }
+  deriving Functor
+
+instance Applicative ParBuild where
+  pure = ParBuild . pure
+  liftA2 f (ParBuild a) (ParBuild b) = ParBuild $ par2 f a b
 
 data BuildInvalidated = BuildInvalidated
   deriving Show
@@ -93,27 +104,20 @@ peekCVar (CVar v) = do
     Just (a, _) -> pure a
     _ -> retrySTM
 
--- -- The instance derived via Cayley only runs setup once, whereas we need to run it for each value
--- itraverse' :: (Show i, Ord i, TraversableWithIndex i t) => Build a b -> Build (t a) (t b)
--- itraverse' (Build setup) = Build $ do
---     stashRef <- newTVarIO Map.empty
---     let envCheck = ST $ do
---           readTVar stashRef >>= runStatusTracker . foldMap fst
---     pure . (envCheck,) $ \xs -> do
---         funcMap <- readTVarIO stashRef
---         (os, resultMap) <- flip runStateT Map.empty . ifor xs $ \i x -> do
---             Map.lookup i funcMap & \case
---               Nothing -> liftIO setup >>= \r@(_, f) -> modify (Map.insert i r) *> liftIO (putStrLn $ "initializing: " <> show i) *> lift (f x)
---               Just r@(_, f) -> modify (Map.insert i r) *> lift (f x)
---         atomically $ writeTVar stashRef resultMap
---         pure os
-
--- build :: MonadIO m => m i -> (o -> m r) -> Build i o -> m r
--- build readInput handler (Build setup) = do
---     (_, f) <- liftIO setup
---     i <- readInput
---     o <- f i
---     handler o
+itraverse' :: forall i t a b. (Show i, Hashable i, TraversableWithIndex i t, Eq i) => Build a b -> Build (t a) (t b)
+itraverse' (Build setup) = Build $ do
+    stashRef <- StmMap.newIO
+    pure $ \xs -> do
+         -- Initialize and run all setups concurrently
+         runParBuild . ifor xs $ \i x -> ParBuild $ do
+           atomically (StmMap.lookup i stashRef) >>= \case
+             Nothing -> do
+               f <- liftIO setup
+               liftIO . print $ "initializing " <> show i
+               atomically (StmMap.insert f i stashRef)
+               f x
+             Just f -> do
+               f x
 
 -- -- TODO: properly accept input OR check env changes
 watch :: IO i -> (o -> IO ()) -> Build i o -> IO a
@@ -334,9 +338,13 @@ exampleStrong = do
   watch (pure ((),())) (print) $ proc inp -> do
     counter <<< never <<< log "JOIN" <<< (log "LEFT" <<< watchFiles <<< arr (const ["ChangeLog.md"])) *** (log "RIGHT" <<< watchFiles <<< arr (const ["README.md"])) -< inp
 
+exampleTraversed :: IO ()
+exampleTraversed = do
+  watch (pure [1, 2, 3, 4]) (print) $ proc inp -> do
+    itraverse' trace <<< arr (\x -> replicate x x) <<< counter <<< ticker 1000 -< inp
 
 example :: IO ()
-example = exampleStrong
+example = exampleTraversed
 
 bail :: MonadTrans t => t (ContT () IO) a
 bail = lift . shiftT $ \_cc -> pure ()
