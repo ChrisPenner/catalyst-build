@@ -259,13 +259,25 @@ exampleFileWatch = do
 clever :: String -> Build i i
 clever s = Build $ do
   pure $ \i -> do
-    onInterrupt $ print s
+    liftIO $ bracketOnError (pure ()) (const $ print s) $ (const $ threadDelay 10000000)
     pure i
 
-onInterrupt :: IO a -> BuildM ()
-onInterrupt cleanup = do
+bracketInterrupts :: IO a -> (a -> IO b) -> (a -> IO c) -> BuildM c
+bracketInterrupts initialize cleanup go = do
   lift . shiftT $ \cc -> do
-    lift $ onException (cc ()) cleanup
+    lift $ bracket initialize cleanup (go >=> cc)
+
+bracketInterrupts' :: IO a -> (a -> IO b) -> ContT () IO a
+bracketInterrupts' initialize cleanup = do
+  shiftT $ lift . bracket initialize cleanup
+
+bracketInterrupts_ :: IO a -> IO b -> IO c -> BuildM c
+bracketInterrupts_ initialize cleanup go =
+  bracketInterrupts initialize (const cleanup) (const go)
+
+onInterrupts :: IO a -> IO b -> BuildM a
+onInterrupts go cleanup = do
+  bracketInterrupts_ (pure ()) cleanup go
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
