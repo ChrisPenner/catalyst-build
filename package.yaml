@@ -27,16 +27,13 @@ dependencies:
 - unordered-containers
 - bytestring
 - profunctors
-- catalyst
 - directory
-- unix
-- stm
-- bifunctors
 - indexed-traversable
 - async
 - unliftio
 - fsnotify
 - stm-containers
+- hashable
 
 library:
   source-dirs: src

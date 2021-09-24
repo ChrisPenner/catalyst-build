@@ -11,7 +11,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Catalyst.Build where
 import Control.Arrow
-import Control.Category ( Category )
+import qualified Control.Category as C
 import Control.Monad
 import Control.Applicative hiding (WrappedArrow)
 import Data.Profunctor.Cayley
@@ -37,7 +37,7 @@ import Data.Functor.WithIndex
 
 newtype Build i o =
     Build (IO (i -> BuildM o))
-    deriving (Profunctor, Category, ArrowChoice) via (Cayley IO (Kleisli BuildM))
+    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli BuildM))
     deriving (Strong, Choice) via WrappedArrow Build
 
 type BuildM = (ReaderT FW.FileWatcher (ContT () IO))
@@ -205,6 +205,13 @@ cutBy comp = Build $ do
         case comp lastI i of
           Clean -> bail
           _ -> rerun i
+
+  -- left' (Tester f) = Tester $ \case
+  --   Nothing -> Left <$> f Nothing
+  --   Just (Left a) -> Left <$> f (Just a)
+  --   Just (Right b) -> pure $ Right b
+
+
 
 -- Returns a new (trigger, waiter) pair.
 -- The waiter will block until the trigger is executed.
