@@ -1,6 +1,6 @@
 module Main where
 
-import Catalyst.Build
+import Juke
 
 main :: IO ()
 main = example

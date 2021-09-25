@@ -9,7 +9,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-module Catalyst.Build where
+{-# LANGUAGE FlexibleInstances #-}
+module Juke (Juke(..), Builder, retriggerOn, newEmptyCVarIO, waitCVar, putCVar, peekCVar, cachedEq, asyncWithCleanup) where
+
 import Control.Arrow
 import qualified Control.Category as C
 import Control.Monad
@@ -21,7 +23,7 @@ import UnliftIO
 import UnliftIO.Concurrent
 import Control.Monad.Trans.Cont
 import Control.Monad.Reader
-import qualified Catalyst.Build.FileWatcher as FW
+import qualified Juke.FileWatcher as FW
 import System.FSNotify
 import qualified Data.HashMap.Strict as HM
 import System.Directory
@@ -35,16 +37,24 @@ import qualified StmContainers.Map as StmMap
 import Data.Hashable
 import Data.Functor.WithIndex
 
-newtype Build i o =
-    Build (IO (i -> BuildM o))
-    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli BuildM))
-    deriving (Strong, Choice) via WrappedArrow Build
+newtype Juke ctx i o =
+    Juke (IO (i -> Builder ctx o))
+    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
+    deriving (Strong, Choice) via WrappedArrow (Juke ctx)
 
-type BuildM = (ReaderT FW.FileWatcher (ContT () IO))
-newtype ParBuild a = ParBuild { runParBuild :: ReaderT FW.FileWatcher (ContT () IO) a }
+newtype Builder ctx a = Builder {runBuilder ::  (ContT () (Inner ctx)) a}
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+type Inner ctx = (ReaderT (FW.FileWatcher, ctx) IO)
+
+instance MonadReader (ctx) (Builder ctx) where
+  ask = Builder $ asks snd
+  local f (Builder m) = Builder (local (second f)$ m)
+
+newtype ParBuild ctx a = ParBuild { runParBuild :: Builder ctx a}
   deriving Functor
 
-instance Applicative ParBuild where
+instance Applicative (ParBuild ctx) where
   pure = ParBuild . pure
   liftA2 f (ParBuild a) (ParBuild b) = ParBuild $ par2 f a b
 
@@ -52,29 +62,29 @@ data BuildInvalidated = BuildInvalidated
   deriving Show
 instance Exception BuildInvalidated where
 
-instance Arrow Build where
-  arr f = Build $ pure (pure . f)
-  Build setupL *** Build setupR = Build $ do
+instance Arrow (Juke ctx) where
+  arr f = Juke $ pure (pure . f)
+  Juke setupL *** Juke setupR = Juke $ do
     (lf, rf) <- concurrently setupL setupR
     pure $ \(l, r) -> do
       par2 (,) (lf l) (rf r)
 
-par2 :: forall a b c. (a -> b -> c) -> BuildM a -> BuildM b -> BuildM c
-par2 f l r = do
+par2 :: forall ctx a b c. (a -> b -> c) -> Builder ctx a -> Builder ctx b -> Builder ctx c
+par2 f (Builder l) (Builder r) = Builder $ do
   lVar <- newEmptyCVarIO
   rVar <- newEmptyCVarIO
-  fm <- ask
-  let ioL :: IO () = flip runContT (atomically . putCVar lVar) . flip runReaderT fm $ l
-  let ioR :: IO () = flip runContT (atomically . putCVar rVar) . flip runReaderT fm $ r
+  let ioL :: Inner ctx () = flip runContT (atomically . putCVar lVar) $ l
+  let ioR :: Inner ctx () = flip runContT (atomically . putCVar rVar) $ r
   -- This blocks until we have a new result from EITHER side
-  let waitNext = atomically $ do
+  let waitNext :: Inner ctx c
+      waitNext = atomically $ do
                    liftA2 f (waitCVar lVar) (waitCVar rVar)
                      <|> liftA2 f (waitCVar lVar) (peekCVar rVar)
                      <|> liftA2 f (peekCVar lVar) (waitCVar rVar)
   -- capture downstream continuation
-  lift . shiftT $ \cc -> do
+  shiftT $ \cc -> do
     -- Kick off each side of the computation
-    liftIO $ withAsync ioL . const . withAsync ioR . const $ do
+    lift $ withAsync ioL . const . withAsync ioR . const $ do
         -- This runs the continuatin until a change is detected on one of our sides
         let looper res = do
               nextRes <- withAsync (cc res) $ \_ -> waitNext
@@ -106,13 +116,13 @@ peekCVar (CVar v) = do
 
 -- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
-itraversed :: forall i t a b. (Hashable i, TraversableWithIndex i t, Eq i) => Build a b -> Build (t a) (t b)
+itraversed :: (Hashable i, TraversableWithIndex i t, Eq i) => Juke ctx a b -> Juke ctx (t a) (t b)
 itraversed f = lmap (imap (,)) (traversedWithKey fst (lmap snd f))
 
 -- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
-traversedWithKey :: forall k t a b. (Hashable k, Eq k, Traversable t) => (a -> k) -> Build a b -> Build (t a) (t b)
-traversedWithKey getKey (Build setup) = Build $ do
+traversedWithKey :: (Hashable k, Eq k, Traversable t) => (a -> k) -> Juke ctx a b -> Juke ctx (t a) (t b)
+traversedWithKey getKey (Juke setup) = Juke $ do
     stashRef <- StmMap.newIO
     pure $ \xs -> do
          -- Initialize and run all setups concurrently
@@ -127,37 +137,37 @@ traversedWithKey getKey (Build setup) = Build $ do
                f x
 
 -- -- TODO: properly accept input OR check env changes
-watch :: IO i -> (o -> IO ()) -> Build i o -> IO a
-watch readInput handler (Build setup) = do
+watch :: ctx -> IO i -> (o -> IO ()) -> Juke ctx i o -> IO a
+watch ctx readInput handler (Juke setup) = do
     FW.withFileWatcher $ \fw -> do
       f <- setup
       forever $ do
         i <- readInput
-        flip runContT handler . flip runReaderT fw $ f i
+        flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
-arrIO :: (i -> IO o) -> Build i o
-arrIO f = Build (pure (liftIO . f))
+arrIO :: (i -> IO o) -> Juke ctx i o
+arrIO f = Juke (pure (liftIO . f))
 
--- readFile :: Build FilePath BS.ByteString
+-- readFile :: Juke ctx FilePath BS.ByteString
 -- readFile = cacheEq (fileModified >>> (arrIO BS.readFile))
 
-trace :: (Show a) => Build a a
+trace :: (Show a) => Juke ctx a a
 trace = tap print
 
-log :: String -> Build a a
+log :: String -> Juke ctx a a
 log s = tap (const $ putStrLn s)
 
-tap :: (a -> IO b) -> Build a a
+tap :: (a -> IO b) -> Juke ctx a a
 tap f = arrIO $ \a -> f a *> pure a
 
-cachedEq :: Eq i => Build i o -> Build i o
+cachedEq :: Eq i => Juke ctx i o -> Juke ctx i o
 cachedEq = cachedOn id
 
-cachedOn :: Eq a => (i -> a) -> Build i o -> Build i o
+cachedOn :: Eq a => (i -> a) -> Juke ctx i o -> Juke ctx i o
 cachedOn project = cachedBy (eq `on` project)
 
-cachedBy :: (i -> i -> Status) -> Build i o -> Build i o
-cachedBy comp (Build setup) = Build $ do
+cachedBy :: (i -> i -> Status) -> Juke ctx i o -> Juke ctx i o
+cachedBy comp (Juke setup) = Juke $ do
   go <- setup
   lastRunInput <- newTVarIO Nothing
   lastRunOutput <- newTVarIO Nothing
@@ -177,25 +187,25 @@ cachedBy comp (Build setup) = Build $ do
           (Clean, Just o) -> pure o
           _ -> rerun i
 
-cutEq :: Eq i => Build i i
+cutEq :: Eq i => Juke ctx i i
 cutEq = cutOn id
 
-cutOn :: Eq a => (i -> a) -> Build i i
+cutOn :: Eq a => (i -> a) -> Juke ctx i i
 cutOn project = cutBy (eq `on` project)
 
 -- Don't retrigger the continuation unless the input has meaningfully changed.
 -- Leaves the old continuation running in the background.
-cutBy :: (i -> i -> Status) -> Build i i
-cutBy comp = Build $ do
+cutBy :: (i -> i -> Status) -> Juke ctx i i
+cutBy comp = Juke $ do
   lastRunInput <- newTVarIO Nothing
   lastRunRef <- newTVarIO Nothing
-  let rerun i = do
+  let rerun i = Builder $ do
         atomically $ writeTVar lastRunInput (Just i)
         -- Cancel any existing run
         readTVarIO lastRunRef >>= maybe (pure ()) cancel
-        lift . shiftT $ \cc -> do
+        shiftT $ \cc -> do
           -- TODO: add some masked sections here for exception safety.
-          ref <- liftIO $ async (cc i)
+          ref <- lift $ async (cc i)
           atomically $ writeTVar lastRunRef (Just ref)
   pure $ \i -> do
     readTVarIO lastRunInput >>= \case
@@ -249,11 +259,12 @@ instance Monoid Status where
 eq :: Eq a => a -> a -> Status
 eq a b = if a == b then Clean else Dirty
 
-watchFileHelper :: (MonadReader FW.FileWatcher m, MonadIO m) => FilePath -> (Event -> IO ()) -> m FW.StopWatching
-watchFileHelper fp handler = ask >>= \fw -> liftIO (FW.watchFile fw fp handler)
+watchFileHelper :: FilePath -> (Event -> IO ()) -> Builder ctx FW.StopWatching
+watchFileHelper fp handler = Builder $ do
+  asks fst >>= \fw -> liftIO (FW.watchFile fw fp handler)
 
-watchFiles :: Build [FilePath] [FilePath]
-watchFiles = Build $ do
+watchFiles :: Juke ctx [FilePath] [FilePath]
+watchFiles = Juke $ do
   lastFilesRef <- newTVarIO HM.empty
   (trigger, waiter) <- newTrigger
   pure $ \fs -> do
@@ -262,7 +273,7 @@ watchFiles = Build $ do
             absPath <- liftIO $ makeAbsolute path
             HM.lookup absPath lastFilesMap & \case
               Nothing -> do
-                  cancelWatch <- watchFileHelper absPath . const $ trigger
+                  cancelWatch <- lift . watchFileHelper absPath . const $ trigger
                   modify (HM.insert absPath cancelWatch)
               Just canceller -> modify (HM.insert absPath canceller)
         let newlyRemoved = HM.difference lastFilesMap currentFilesMap
@@ -279,28 +290,28 @@ waitJust var = readTVar var >>= \case
   Just a -> pure a
 
 type Millis = Int
-ticker :: Millis -> Build i i
-ticker millis = Build $ do
+ticker :: Millis -> Juke ctx i i
+ticker millis = Juke $ do
   pure $ \i -> retriggerOn () (threadDelay (millis * 1000)) *> pure i
 
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: a -> IO a -> BuildM a
-retriggerOn fstA waiter = lift . shiftT $ \cc -> do
+retriggerOn :: a -> IO a -> Builder ctx a
+retriggerOn fstA waiter = Builder $ shiftT $ \cc -> do
   let looper a = do
-         nextA <- withAsync (cc a) $ const waiter
+         nextA <- lift $ withAsync (cc a) $ const (liftIO waiter)
          looper nextA
-  liftIO $ looper fstA
+  looper fstA
 
 -- Never is a build-step which NEVER calls its continuation, and never completes
-never :: Build i x
-never = Build $ do
+never :: Juke ctx i x
+never = Juke $ do
   pure $ \_ -> forever $ threadDelay 1000000000
 
 -- | counter keeps track of how many times it has been retriggered.
-counter :: Build i Int
-counter = Build $ do
+counter :: Juke ctx i Int
+counter = Juke $ do
     nRef <- newTVarIO 0
     pure $ \_ -> do
         atomically $ do
@@ -309,61 +320,67 @@ counter = Build $ do
 
 exampleFileWatch :: IO ()
 exampleFileWatch = do
-  watch (pure ["deps.txt"]) (print) $ proc inp -> do
+  watch () (pure ["deps.txt"]) (print) $ proc inp -> do
     deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< clever "*** Shallow" <<< watchFiles -< inp
     let depFiles = BS.unpack <$> BS.lines deps
     -- if length depFiles > 2 then readFile -< "README.md"
     --                        else ticker 1000 <<< readFile -< "Changelog.md"
     log "DEPS:" <<< ticker 1000 <<< clever "*** Deepest" <<< watchFiles <<< clever "*** Deep" -< depFiles
 
-clever :: String -> Build i i
-clever s = Build $ do
+clever :: String -> Juke ctx i i
+clever s = Juke $ do
   pure $ \i -> do
     liftIO $ bracketOnError (pure ()) (const $ print s) $ (const $ threadDelay 10000000)
     pure i
 
-bracketInterrupts :: IO a -> (a -> IO b) -> (a -> IO c) -> BuildM c
-bracketInterrupts initialize cleanup go = do
-  lift . shiftT $ \cc -> do
-    lift $ bracket initialize cleanup (go >=> cc)
+-- bracketInterrupts :: IO a -> (a -> IO b) -> (a -> IO c) -> Builder ctx c
+-- bracketInterrupts initialize cleanup go = Builder $ do
+--   lift . shiftT $ \cc -> do
+--     lift $ bracket initialize cleanup (go >=> cc)
 
-bracketInterrupts' :: IO a -> (a -> IO b) -> ContT () IO a
-bracketInterrupts' initialize cleanup = do
+bracketInterrupts' :: ReaderT (FW.FileWatcher, ctx) IO a -> (a -> ReaderT (FW.FileWatcher, ctx) IO b) -> Builder ctx a
+bracketInterrupts' initialize cleanup = Builder $ do
   shiftT $ lift . bracket initialize cleanup
 
-bracketInterrupts_ :: IO a -> IO b -> IO c -> BuildM c
-bracketInterrupts_ initialize cleanup go =
-  bracketInterrupts initialize (const cleanup) (const go)
+-- bracketInterrupts_ :: IO a -> IO b -> IO c -> Builder ctx c
+-- bracketInterrupts_ initialize cleanup go =
+--   bracketInterrupts initialize (const cleanup) (const go)
 
-onInterrupts :: IO a -> IO b -> BuildM a
-onInterrupts go cleanup = do
-  bracketInterrupts_ (pure ()) cleanup go
+-- onInterrupts :: IO a -> IO b -> Builder ctx a
+-- onInterrupts go cleanup = do
+--   bracketInterrupts_ (pure ()) cleanup go
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
-  watch (pure ()) (print) $ proc inp -> do
+  watch () (pure ()) (print) $ proc inp -> do
       cachedEq (counter <<< log "inside cache") <<< ticker 300 <<< counter <<< ticker 2000 -< inp
 
 exampleTickerCut :: IO ()
 exampleTickerCut = do
-  watch (pure ()) (print) $ proc inp -> do
+  watch () (pure ()) (print) $ proc inp -> do
       log "after cache" <<< cutEq <<< ticker 100 <<< counter <<< ticker 3000 -< inp
 
 exampleStrong :: IO ()
 exampleStrong = do
-  watch (pure ((),())) (print) $ proc inp -> do
+  watch () (pure ((),())) (print) $ proc inp -> do
     counter <<< never <<< log "JOIN" <<< (log "LEFT" <<< watchFiles <<< arr (const ["ChangeLog.md"])) *** (log "RIGHT" <<< watchFiles <<< arr (const ["README.md"])) -< inp
 
 exampleTraversed :: IO ()
 exampleTraversed = do
-  watch (pure [1, 2, 3, 4]) (print) $ proc inp -> do
+  watch () (pure [1, 2, 3, 4]) (print) $ proc inp -> do
     itraversed trace <<< arr (\x -> replicate x x) <<< counter <<< ticker 1000 -< inp
 
 example :: IO ()
 example = exampleTickerCut
 
-bail :: MonadTrans t => t (ContT () IO) a
-bail = lift . shiftT $ \_cc -> pure ()
+bail :: Builder ctx a
+bail = Builder $ shiftT $ \_cc -> pure ()
+
+asyncWithCleanup :: Inner ctx () -> Builder ctx ()
+asyncWithCleanup eff = Builder $ do
+  shiftT $ \cc -> do
+    lift $ withAsync eff $ \_ -> do
+      cc ()
 
 -- example :: IO ()
 -- example = do

@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
-module Catalyst.Build.FileWatcher where
+module Juke.FileWatcher where
 import System.FSNotify
 import qualified StmContainers.Map as STMMap
 import Data.Unique
@@ -12,18 +12,21 @@ newtype FileWatcher = FileWatcher
     { handlers :: STMMap.Map FilePath (HM.HashMap Unique (Event -> IO ()))
     }
 
-withFileWatcher :: (FileWatcher -> IO a) -> IO a
+withFileWatcher :: MonadUnliftIO m => (FileWatcher -> m a) -> m a
 withFileWatcher f = do
-    filewatchMap <- STMMap.newIO
-    withManager $ \wm -> do
-        _cancel <- watchTree wm "." (const True) $ \evt -> do
+    filewatchMap <- liftIO $ STMMap.newIO
+    withManager' $ \wm -> do
+        _cancel <- liftIO $ watchTree wm "." (const True) $ \evt -> do
             let pth = eventPath evt
             triggers <- atomically $ STMMap.lookup pth filewatchMap >>= \case
               Nothing -> pure mempty
               Just evtMap -> do
                   pure $ foldMap ($ evt) evtMap
-            triggers
+            liftIO triggers
         f $ FileWatcher filewatchMap
+
+withManager' :: MonadUnliftIO m => (WatchManager -> m a) -> m a
+withManager' f = bracket (liftIO $ startManager) (liftIO . stopManager) f
 
 type StopWatching = IO ()
 watchFile :: FileWatcher -> FilePath -> (Event -> IO ()) -> IO StopWatching
