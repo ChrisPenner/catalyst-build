@@ -4,4 +4,4 @@ import Juke.Internal
 import Juke.React
 
 main :: IO ()
-main = pure ()
+main = concurrencyExample

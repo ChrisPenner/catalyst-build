@@ -31,14 +31,14 @@ useState def = Juke $ do
 
 
 -- Runs the given effect asyncronously using the most recent input.
-useEffectNoCache :: Juke m (IO ()) ()
+useEffectNoCache :: Juke m (IO x) ()
 useEffectNoCache = Juke $ do
   pure $ \eff -> do
-    asyncWithCleanup $ eff
+    asyncWithCleanup $ void $ eff
 
 -- Runs the given effect asyncronously using the most recent input.
 -- Only kills and re-runs the effect when the input changes.
-useEffect :: Eq a => Juke m (IO (), a) ()
+useEffect :: Eq a => Juke m (IO x, a) ()
 useEffect = cachedOn snd $ lmap fst useEffectNoCache
 
 type Context = TM.TMap
@@ -55,13 +55,9 @@ withContext (Juke setup) = Juke $ do
   pure $ \(a, i) -> do
     local (TM.insert a) $ f i
 
--- contextExample :: IO ()
--- contextExample = run TM.empty "first" (const $ pure ()) $ proc inp -> do
---   -- withContext @String x -< ""
-
 stateExample :: IO ()
-stateExample = watch () (pure ()) print $ proc inp -> do
+stateExample = watch () () print $ proc inp -> do
   (n, updater) <- tap (print . fst) <<< useState 0 -< ()
   let eff = (forever $ print ("loop" <> show n) *> updater succ *> print "updated" *> threadDelay (n * 1000000))
   useEffect -< (eff, n)
-  returnA <<< never @() -< n
+  returnA -< n

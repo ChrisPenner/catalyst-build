@@ -40,7 +40,7 @@ import Data.Monoid
 
 newtype Juke ctx i o =
     Juke (IO (i -> Builder ctx o))
-    deriving ( Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
+    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
     deriving (Strong, Choice) via WrappedArrow (Juke ctx)
 
 newtype Builder ctx a = Builder {runBuilder ::  (ContT () (Inner ctx)) a}
@@ -95,7 +95,7 @@ par2 f (Builder l) (Builder r) = Builder $ do
               nextRes <- withAsync (mToIO $ cc res) $ \h ->
                 race waitNext (wait hl *> wait hr) >>= \case
                   Left next -> pure (Just next)
-                  Right _ -> pure Nothing
+                  Right _ -> wait h *> pure Nothing
               case nextRes of
                 Nothing -> pure ()
                 Just n -> looper n
@@ -151,12 +151,11 @@ traversedWithKey getKey (Juke setup) = Juke $ do
                f x
 
 -- -- TODO: properly accept input OR check env changes
-watch :: ctx -> IO i -> (o -> IO ()) -> Juke ctx i o -> IO a
-watch ctx readInput handler (Juke setup) = do
+watch :: ctx -> i -> (o -> IO ()) -> Juke ctx i o -> IO a
+watch ctx i handler (Juke setup) = do
     FW.withFileWatcher $ \fw -> do
       f <- setup
       forever $ do
-        i <- readInput
         flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
 run :: ctx -> i -> (o -> IO ()) -> Juke ctx i o -> IO ()
@@ -335,7 +334,7 @@ counter = Juke $ do
 
 exampleFileWatch :: IO ()
 exampleFileWatch = do
-  watch () (pure ["deps.txt"]) (print) $ proc inp -> do
+  watch () (["deps.txt"]) (print) $ proc inp -> do
     deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< clever "*** Shallow" <<< watchFiles -< inp
     let depFiles = BS.unpack <$> BS.lines deps
     -- if length depFiles > 2 then readFile -< "README.md"
@@ -367,22 +366,22 @@ bracketInterrupts' initialize cleanup = Builder $ do
 
 exampleTickerCache :: IO ()
 exampleTickerCache = do
-  watch () (pure ()) (print) $ proc inp -> do
+  watch () () (print) $ proc inp -> do
       cachedEq (counter <<< log "inside cache") <<< ticker 300 <<< counter <<< ticker 2000 -< inp
 
 exampleTickerCut :: IO ()
 exampleTickerCut = do
-  watch () (pure ()) (print) $ proc inp -> do
+  watch () () (print) $ proc inp -> do
       log "after cache" <<< cutEq <<< ticker 100 <<< counter <<< ticker 3000 -< inp
 
 exampleStrong :: IO ()
 exampleStrong = do
-  watch () (pure ((),())) (print) $ proc inp -> do
+  watch () ((),()) (print) $ proc inp -> do
     counter <<< never <<< log "JOIN" <<< (log "LEFT" <<< watchFiles <<< arr (const ["ChangeLog.md"])) *** (log "RIGHT" <<< watchFiles <<< arr (const ["README.md"])) -< inp
 
 exampleTraversed :: IO ()
 exampleTraversed = do
-  watch () (pure [1, 2, 3, 4]) (print) $ proc inp -> do
+  watch () [1, 2, 3, 4] (print) $ proc inp -> do
     itraversed trace <<< arr (\x -> replicate x x) <<< counter <<< ticker 1000 -< inp
 
 example :: IO ()
@@ -399,7 +398,19 @@ asyncWithCleanup eff = Builder $ do
   shiftT $ \cc -> do
     lift $ withAsync (liftIO eff) $ \_ -> do
       cc ()
-      
+
+
+delayBy :: Int -> Juke ctx i i
+delayBy millis = Juke $ do
+  pure $ \i -> do
+    liftIO $ threadDelay (millis * 1000)
+    pure i
+
+concurrencyExample :: IO ()
+concurrencyExample = watch () () print $ proc inp -> do
+          l <- trace <<< delayBy 100 -< 'l'
+          r <- trace <<< delayBy 50 -< 'r'
+          returnA -< (l, r)
 
 
 
@@ -414,3 +425,5 @@ asyncWithCleanup eff = Builder $ do
 --         if length depFiles > 2 then readFile -< "README.md"
 --                                else ticker 1000 <<< readFile -< "Changelog.md"
 --         -- itraverse' readFile -< Map.fromList ((\x -> (x, x)) <$> depFiles)
+--
+--
