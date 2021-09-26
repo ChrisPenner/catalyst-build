@@ -10,27 +10,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
-module Juke.Internal
-  ( Juke (..),
-    Builder (..),
-    retriggerOn,
-    newEmptyCVarIO,
-    waitCVar,
-    putCVar,
-    peekCVar,
-    newCVarIO,
-    cachedEq,
-    cachedOn,
-    cachedBy,
-    asyncWithCleanup,
-    run,
-    watch,
-    tap,
-    trace,
-    arrIO,
-    never
-  )
-where
+module Juke.Internal where
 
 import Control.Arrow
 import qualified Control.Category as C
@@ -56,6 +36,7 @@ import Data.Traversable.WithIndex
 import qualified StmContainers.Map as StmMap
 import Data.Hashable
 import Data.Functor.WithIndex
+import Data.Monoid
 
 newtype Juke ctx i o =
     Juke (IO (i -> Builder ctx o))
@@ -410,11 +391,15 @@ example = exampleTickerCut
 bail :: Builder ctx a
 bail = Builder $ shiftT $ \_cc -> pure ()
 
+emit :: [a] -> Builder ctx a
+emit as = Builder $ shiftT $ \cc -> lift . getAp $ foldMap (Ap . cc) as
+
 asyncWithCleanup :: IO () -> Builder ctx ()
 asyncWithCleanup eff = Builder $ do
   shiftT $ \cc -> do
     lift $ withAsync (liftIO eff) $ \_ -> do
       cc ()
+      
 
 
 

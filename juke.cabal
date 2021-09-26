@@ -28,6 +28,7 @@ library
       Juke.FileWatcher
       Juke.Internal
       Juke.React
+      Juke.Stream
   other-modules:
       Paths_juke
   hs-source-dirs:
