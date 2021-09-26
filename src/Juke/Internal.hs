@@ -10,6 +10,8 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PolyKinds #-}
 module Juke.Internal where
 
 import Control.Arrow
@@ -38,10 +40,12 @@ import Data.Hashable
 import Data.Functor.WithIndex
 import Data.Monoid
 
-newtype Juke ctx i o =
+data Strategy = Stream | Reactive
+
+newtype Juke (strat :: Strategy) ctx i o =
     Juke (IO (i -> Builder ctx o))
-    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
-    deriving (Strong, Choice) via WrappedArrow (Juke ctx)
+    deriving (Profunctor, C.Category) via (Cayley IO (Kleisli (Builder ctx)))
+    -- deriving (Strong, Choice) via WrappedArrow (Juke strat ctx)
 
 newtype Builder ctx a = Builder {runBuilder ::  (ContT () (Inner ctx)) a}
   deriving (Functor, Applicative, Monad, MonadIO)
@@ -63,14 +67,33 @@ data BuildInvalidated = BuildInvalidated
   deriving Show
 instance Exception BuildInvalidated where
 
--- This has better parallelism, but doesn't work with "pure" runs, should probably be a
--- different instance or w/e.
-instance Arrow (Juke ctx) where
+instance Arrow (Juke Stream ctx) where
+  arr f = Juke $ pure (pure . f)
+  Juke setupL *** Juke setupR = Juke $ do
+    (lf, rf) <- liftA2 (,) setupL setupR
+    pure $ \(l, r) -> do
+      liftA2 (,) (lf l) (rf r)
+
+instance Arrow (Juke Reactive ctx) where
   arr f = Juke $ pure (pure . f)
   Juke setupL *** Juke setupR = Juke $ do
     (lf, rf) <- concurrently setupL setupR
     pure $ \(l, r) -> do
       par2 (,) (lf l) (rf r)
+
+instance ArrowChoice (Juke Stream ctx) where
+  Juke setupL +++ Juke setupR = Juke $ do
+    (l, r) <- liftA2 (,) setupL setupR
+    pure $ (\case
+       Left a -> Left <$> l a
+       Right b -> Right <$> r b)
+
+instance ArrowChoice (Juke Reactive ctx) where
+  Juke setupL +++ Juke setupR = Juke $ do
+    (l, r) <- concurrently setupL setupR
+    pure $ (\case
+       Left a -> Left <$> l a
+       Right b -> Right <$> r b)
 
 par2 :: forall ctx a b c. (a -> b -> c) -> Builder ctx a -> Builder ctx b -> Builder ctx c
 par2 f (Builder l) (Builder r) = Builder $ do
@@ -130,12 +153,12 @@ peekCVar (CVar v) = do
 
 -- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
-itraversed :: (Hashable i, TraversableWithIndex i t, Eq i) => Juke ctx a b -> Juke ctx (t a) (t b)
+itraversed :: (Hashable i, TraversableWithIndex i t, Eq i) => Juke Reactive ctx a b -> Juke Reactive ctx (t a) (t b)
 itraversed f = lmap (imap (,)) (traversedWithKey fst (lmap snd f))
 
 -- It's possible to write version of this with only an Ord constraint, just haven't done it yet.
 -- It would add more lock contention
-traversedWithKey :: (Hashable k, Eq k, Traversable t) => (a -> k) -> Juke ctx a b -> Juke ctx (t a) (t b)
+traversedWithKey :: (Hashable k, Eq k, Traversable t) => (a -> k) -> Juke Reactive ctx a b -> Juke Reactive ctx (t a) (t b)
 traversedWithKey getKey (Juke setup) = Juke $ do
     stashRef <- StmMap.newIO
     pure $ \xs -> do
@@ -151,41 +174,41 @@ traversedWithKey getKey (Juke setup) = Juke $ do
                f x
 
 -- -- TODO: properly accept input OR check env changes
-watch :: ctx -> i -> (o -> IO ()) -> Juke ctx i o -> IO a
+watch :: ctx -> i -> (o -> IO ()) -> Juke Reactive ctx i o -> IO a
 watch ctx i handler (Juke setup) = do
     FW.withFileWatcher $ \fw -> do
       f <- setup
       forever $ do
         flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
-run :: ctx -> i -> (o -> IO ()) -> Juke ctx i o -> IO ()
+run :: ctx -> i -> (o -> IO ()) -> Juke Stream ctx i o -> IO ()
 run ctx i handler (Juke setup) = do
     FW.withFileWatcher $ \fw -> do
       f <- setup
       flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
-arrIO :: (i -> IO o) -> Juke ctx i o
+arrIO :: (i -> IO o) -> Juke s ctx i o
 arrIO f = Juke (pure (liftIO . f))
 
 -- readFile :: Juke ctx FilePath BS.ByteString
 -- readFile = cacheEq (fileModified >>> (arrIO BS.readFile))
 
-trace :: (Show a) => Juke ctx a a
+trace :: (Show a) => Juke s ctx a a
 trace = tap print
 
-log :: String -> Juke ctx a a
+log :: String -> Juke s ctx a a
 log s = tap (const $ putStrLn s)
 
-tap :: (a -> IO b) -> Juke ctx a a
+tap :: (a -> IO b) -> Juke s ctx a a
 tap f = arrIO $ \a -> f a *> pure a
 
-cachedEq :: Eq i => Juke ctx i o -> Juke ctx i o
+cachedEq :: Eq i => Juke Reactive ctx i o -> Juke Reactive ctx i o
 cachedEq = cachedOn id
 
-cachedOn :: Eq a => (i -> a) -> Juke ctx i o -> Juke ctx i o
+cachedOn :: Eq a => (i -> a) -> Juke Reactive ctx i o -> Juke Reactive ctx i o
 cachedOn project = cachedBy (eq `on` project)
 
-cachedBy :: (i -> i -> Status) -> Juke ctx i o -> Juke ctx i o
+cachedBy :: (i -> i -> Status) -> Juke Reactive ctx i o -> Juke Reactive ctx i o
 cachedBy comp (Juke setup) = Juke $ do
   go <- setup
   lastRunInput <- newTVarIO Nothing
@@ -206,15 +229,15 @@ cachedBy comp (Juke setup) = Juke $ do
           (Clean, Just o) -> pure o
           _ -> rerun i
 
-cutEq :: Eq i => Juke ctx i i
+cutEq :: Eq i => Juke Reactive ctx i i
 cutEq = cutOn id
 
-cutOn :: Eq a => (i -> a) -> Juke ctx i i
+cutOn :: Eq a => (i -> a) -> Juke Reactive ctx i i
 cutOn project = cutBy (eq `on` project)
 
 -- Don't retrigger the continuation unless the input has meaningfully changed.
 -- Leaves the old continuation running in the background.
-cutBy :: (i -> i -> Status) -> Juke ctx i i
+cutBy :: (i -> i -> Status) -> Juke Reactive ctx i i
 cutBy comp = Juke $ do
   lastRunInput <- newTVarIO Nothing
   lastRunRef <- newTVarIO Nothing
@@ -277,7 +300,7 @@ watchFileHelper :: FilePath -> (Event -> IO ()) -> Builder ctx FW.StopWatching
 watchFileHelper fp handler = Builder $ do
   asks fst >>= \fw -> liftIO (FW.watchFile fw fp handler)
 
-watchFiles :: Juke ctx [FilePath] [FilePath]
+watchFiles :: Juke Reactive ctx [FilePath] [FilePath]
 watchFiles = Juke $ do
   lastFilesRef <- newTVarIO HM.empty
   (trigger, waiter) <- newTrigger
@@ -304,7 +327,7 @@ waitJust var = readTVar var >>= \case
   Just a -> pure a
 
 type Millis = Int
-ticker :: Millis -> Juke ctx i i
+ticker :: Millis -> Juke Reactive ctx i i
 ticker millis = Juke $ do
   pure $ \i -> retriggerOn () (threadDelay (millis * 1000)) *> pure i
 
@@ -319,12 +342,12 @@ retriggerOn fstA waiter = Builder $ shiftT $ \cc -> do
   looper fstA
 
 -- Never is a build-step which NEVER calls its continuation, and never completes
-never :: forall x i ctx. Juke ctx i x
+never :: forall x i ctx. Juke Reactive ctx i x
 never = Juke $ do
   pure $ \_ -> forever $ threadDelay 1000000000
 
 -- | counter keeps track of how many times it has been retriggered.
-counter :: Juke ctx i Int
+counter :: Juke Reactive ctx i Int
 counter = Juke $ do
     nRef <- newTVarIO 0
     pure $ \_ -> do
@@ -332,20 +355,14 @@ counter = Juke $ do
             modifyTVar nRef succ
             readTVar nRef
 
-exampleFileWatch :: IO ()
-exampleFileWatch = do
-  watch () (["deps.txt"]) (print) $ proc inp -> do
-    deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< clever "*** Shallow" <<< watchFiles -< inp
-    let depFiles = BS.unpack <$> BS.lines deps
-    -- if length depFiles > 2 then readFile -< "README.md"
-    --                        else ticker 1000 <<< readFile -< "Changelog.md"
-    log "DEPS:" <<< ticker 1000 <<< clever "*** Deepest" <<< watchFiles <<< clever "*** Deep" -< depFiles
-
-clever :: String -> Juke ctx i i
-clever s = Juke $ do
-  pure $ \i -> do
-    liftIO $ bracketOnError (pure ()) (const $ print s) $ (const $ threadDelay 10000000)
-    pure i
+-- exampleFileWatch :: IO ()
+-- exampleFileWatch = do
+--   watch () (["deps.txt"]) (print) $ proc inp -> do
+--     deps <- arrIO (BS.readFile . head) <<< log "reading deps" <<< clever "*** Shallow" <<< watchFiles -< inp
+--     let depFiles = BS.unpack <$> BS.lines deps
+--     -- if length depFiles > 2 then readFile -< "README.md"
+--     --                        else ticker 1000 <<< readFile -< "Changelog.md"
+--     log "DEPS:" <<< ticker 1000 <<< clever "*** Deepest" <<< watchFiles <<< clever "*** Deep" -< depFiles
 
 -- bracketInterrupts :: IO a -> (a -> IO b) -> (a -> IO c) -> Builder ctx c
 -- bracketInterrupts initialize cleanup go = Builder $ do
@@ -400,7 +417,7 @@ asyncWithCleanup eff = Builder $ do
       cc ()
 
 
-delayBy :: Int -> Juke ctx i i
+delayBy :: Int -> Juke Reactive ctx i i
 delayBy millis = Juke $ do
   pure $ \i -> do
     liftIO $ threadDelay (millis * 1000)

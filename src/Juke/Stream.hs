@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 module Juke.Stream where
 
 import Juke.Internal
@@ -5,7 +6,7 @@ import UnliftIO
 import Control.Monad.Trans.Cont
 import Data.Foldable
 
-taking :: Int -> Juke ctx i i
+taking :: Int -> Juke Stream ctx i i
 taking startN = Juke $ do
   nVar <- newTVarIO startN
   pure $ \i -> do
@@ -13,7 +14,7 @@ taking startN = Juke $ do
     if n > 0 then atomically (modifyTVar nVar pred) *> pure i 
              else bail
 
-folded :: Foldable f => Juke ctx (f i) i
+folded :: Foldable f => Juke Stream ctx (f i) i
 folded = Juke $ do
   pure $ emit . toList
 
