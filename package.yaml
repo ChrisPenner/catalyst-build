@@ -33,6 +33,7 @@ dependencies:
 - unliftio
 - fsnotify
 - stm-containers
+- stm
 - hashable
 - typerep-map
 
@@ -60,3 +61,4 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - juke
+    - hspec

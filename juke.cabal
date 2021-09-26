@@ -25,8 +25,8 @@ source-repository head
 
 library
   exposed-modules:
-      Juke
       Juke.FileWatcher
+      Juke.Internal
       Juke.React
   other-modules:
       Paths_juke
@@ -43,6 +43,7 @@ library
     , indexed-traversable
     , mtl
     , profunctors
+    , stm
     , stm-containers
     , transformers
     , typerep-map
@@ -69,6 +70,7 @@ executable juke-exe
     , juke
     , mtl
     , profunctors
+    , stm
     , stm-containers
     , transformers
     , typerep-map
@@ -92,10 +94,12 @@ test-suite juke-test
     , directory
     , fsnotify
     , hashable
+    , hspec
     , indexed-traversable
     , juke
     , mtl
     , profunctors
+    , stm
     , stm-containers
     , transformers
     , typerep-map

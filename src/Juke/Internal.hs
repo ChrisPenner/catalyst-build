@@ -10,7 +10,27 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
-module Juke (Juke(..), Builder, retriggerOn, newEmptyCVarIO, waitCVar, putCVar, peekCVar, cachedEq, asyncWithCleanup) where
+module Juke.Internal
+  ( Juke (..),
+    Builder (..),
+    retriggerOn,
+    newEmptyCVarIO,
+    waitCVar,
+    putCVar,
+    peekCVar,
+    newCVarIO,
+    cachedEq,
+    cachedOn,
+    cachedBy,
+    asyncWithCleanup,
+    run,
+    watch,
+    tap,
+    trace,
+    arrIO,
+    never
+  )
+where
 
 import Control.Arrow
 import qualified Control.Category as C
@@ -39,7 +59,7 @@ import Data.Functor.WithIndex
 
 newtype Juke ctx i o =
     Juke (IO (i -> Builder ctx o))
-    deriving (Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
+    deriving ( Profunctor, C.Category, ArrowChoice) via (Cayley IO (Kleisli (Builder ctx)))
     deriving (Strong, Choice) via WrappedArrow (Juke ctx)
 
 newtype Builder ctx a = Builder {runBuilder ::  (ContT () (Inner ctx)) a}
@@ -62,6 +82,8 @@ data BuildInvalidated = BuildInvalidated
   deriving Show
 instance Exception BuildInvalidated where
 
+-- This has better parallelism, but doesn't work with "pure" runs, should probably be a
+-- different instance or w/e.
 instance Arrow (Juke ctx) where
   arr f = Juke $ pure (pure . f)
   Juke setupL *** Juke setupR = Juke $ do
@@ -73,22 +95,29 @@ par2 :: forall ctx a b c. (a -> b -> c) -> Builder ctx a -> Builder ctx b -> Bui
 par2 f (Builder l) (Builder r) = Builder $ do
   lVar <- newEmptyCVarIO
   rVar <- newEmptyCVarIO
-  let ioL :: Inner ctx () = flip runContT (atomically . putCVar lVar) $ l
-  let ioR :: Inner ctx () = flip runContT (atomically . putCVar rVar) $ r
+  mToIO <- lift $ askRunInIO
+  let ioL :: IO () = mToIO $ flip runContT (atomically . putCVar lVar) $ l
+  let ioR :: IO () = mToIO $ flip runContT (atomically . putCVar rVar) $ r
   -- This blocks until we have a new result from EITHER side
-  let waitNext :: Inner ctx c
+  let waitNext :: IO c
       waitNext = atomically $ do
                    liftA2 f (waitCVar lVar) (waitCVar rVar)
                      <|> liftA2 f (waitCVar lVar) (peekCVar rVar)
                      <|> liftA2 f (peekCVar lVar) (waitCVar rVar)
   -- capture downstream continuation
-  shiftT $ \cc -> do
+  shiftT $ \cc -> liftIO $ do
     -- Kick off each side of the computation
-    lift $ withAsync ioL . const . withAsync ioR . const $ do
-        -- This runs the continuatin until a change is detected on one of our sides
-        let looper res = do
-              nextRes <- withAsync (cc res) $ \_ -> waitNext
-              looper nextRes
+    withAsync ioL $ \hl -> withAsync ioR $ \hr -> do
+        -- This runs the continuation until a change is detected on one of our sides
+        let looper :: c -> IO ()
+            looper res = do
+              nextRes <- withAsync (mToIO $ cc res) $ \h ->
+                race waitNext (wait hl *> wait hr) >>= \case
+                  Left next -> pure (Just next)
+                  Right _ -> pure Nothing
+              case nextRes of
+                Nothing -> pure ()
+                Just n -> looper n
         -- Wait for a first result from both sides before we can start the loop.
         waitNext >>= looper
 
@@ -96,6 +125,10 @@ newtype CVar a = CVar (TVar (Maybe (a, Bool)))
 
 newEmptyCVarIO :: MonadIO m => m (CVar a)
 newEmptyCVarIO = CVar <$> newTVarIO Nothing
+
+-- new cvar which contains a value, but has no changes.
+newCVarIO :: MonadIO m => a -> m (CVar a)
+newCVarIO a = CVar <$> newTVarIO (Just (a, False))
 
 putCVar :: CVar a -> a -> STM ()
 putCVar (CVar v) a = writeTVar v $ Just (a, True)
@@ -144,6 +177,12 @@ watch ctx readInput handler (Juke setup) = do
       forever $ do
         i <- readInput
         flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
+
+run :: ctx -> i -> (o -> IO ()) -> Juke ctx i o -> IO ()
+run ctx i handler (Juke setup) = do
+    FW.withFileWatcher $ \fw -> do
+      f <- setup
+      flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
 arrIO :: (i -> IO o) -> Juke ctx i o
 arrIO f = Juke (pure (liftIO . f))
@@ -231,11 +270,6 @@ newTrigger = do
     var <- newTVarIO False
     pure (atomically $ writeTVar var True, atomically ((readTVar var >>= guard) <* writeTVar var False))
 
-waitForChange :: Eq a => a -> TVar a -> STM ()
-waitForChange a var = do
-    a' <- readTVar var
-    guard (a /= a')
-
 trackInput :: MonadIO m => s -> (i -> m (s, o)) -> IO (TVar (Maybe i), TVar s, i -> m o)
 trackInput def f = do
     inpRef <- newTVarIO Nothing
@@ -305,7 +339,7 @@ retriggerOn fstA waiter = Builder $ shiftT $ \cc -> do
   looper fstA
 
 -- Never is a build-step which NEVER calls its continuation, and never completes
-never :: Juke ctx i x
+never :: forall x i ctx. Juke ctx i x
 never = Juke $ do
   pure $ \_ -> forever $ threadDelay 1000000000
 
@@ -376,11 +410,15 @@ example = exampleTickerCut
 bail :: Builder ctx a
 bail = Builder $ shiftT $ \_cc -> pure ()
 
-asyncWithCleanup :: Inner ctx () -> Builder ctx ()
+asyncWithCleanup :: IO () -> Builder ctx ()
 asyncWithCleanup eff = Builder $ do
   shiftT $ \cc -> do
-    lift $ withAsync eff $ \_ -> do
+    lift $ withAsync (liftIO eff) $ \_ -> do
       cc ()
+
+
+
+
 
 -- example :: IO ()
 -- example = do

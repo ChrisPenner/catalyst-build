@@ -1,6 +1,7 @@
 module Main where
 
-import Juke
+import Juke.Internal
+import Juke.React
 
 main :: IO ()
-main = example
+main = pure ()

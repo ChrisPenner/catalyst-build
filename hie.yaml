@@ -1,3 +1,8 @@
 cradle:
   stack:
+    - path: ./
+      component: "juke:lib"
+
+    - path: ./test
+      component: "juke:test:juke-test"
 
