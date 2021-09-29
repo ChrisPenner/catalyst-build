@@ -130,12 +130,18 @@ newtype CVar a = CVar (TVar (Maybe (a, Bool)))
 newEmptyCVarIO :: MonadIO m => m (CVar a)
 newEmptyCVarIO = CVar <$> newTVarIO Nothing
 
--- new cvar which contains a value, but has no changes.
+-- new cvar which contains a value, and has changes
 newCVarIO :: MonadIO m => a -> m (CVar a)
-newCVarIO a = CVar <$> newTVarIO (Just (a, False))
+newCVarIO a = CVar <$> newTVarIO (Just (a, True))
 
 putCVar :: CVar a -> a -> STM ()
 putCVar (CVar v) a = writeTVar v $ Just (a, True)
+
+waitForEmpty :: CVar a -> STM ()
+waitForEmpty (CVar v) = do
+  readTVar v >>= \case
+    Just (_, True) -> retrySTM
+    _ -> pure ()
 
 -- Only ONE listener will consume each change to a CVar.
 waitCVar :: CVar a -> STM a
@@ -174,12 +180,11 @@ traversedWithKey getKey (Juke setup) = Juke $ do
                f x
 
 -- -- TODO: properly accept input OR check env changes
-watch :: ctx -> i -> (o -> IO ()) -> Juke Reactive ctx i o -> IO a
+watch :: ctx -> i -> (o -> IO ()) -> Juke Reactive ctx i o -> IO ()
 watch ctx i handler (Juke setup) = do
     FW.withFileWatcher $ \fw -> do
       f <- setup
-      forever $ do
-        flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
+      flip runReaderT (fw, ctx) . flip runContT (liftIO . handler) . runBuilder $ f i
 
 run :: ctx -> i -> (o -> IO ()) -> Juke Stream ctx i o -> IO ()
 run ctx i handler (Juke setup) = do
@@ -208,6 +213,8 @@ cachedEq = cachedOn id
 cachedOn :: Eq a => (i -> a) -> Juke Reactive ctx i o -> Juke Reactive ctx i o
 cachedOn project = cachedBy (eq `on` project)
 
+-- TODO: This breaks things like useEffect because the async will still be killed and not
+-- re-fired
 cachedBy :: (i -> i -> Status) -> Juke Reactive ctx i o -> Juke Reactive ctx i o
 cachedBy comp (Juke setup) = Juke $ do
   go <- setup
@@ -318,7 +325,7 @@ watchFiles = Juke $ do
         liftIO . print $ "Current files to watch: " <> show (HM.keys currentFilesMap)
         liftIO $ fold newlyRemoved
         atomically $ writeTVar lastFilesRef currentFilesMap
-        retriggerOn () waiter
+        triggerOn $ \emit -> forever (waiter >>= emit)
         pure fs
 
 waitJust :: TVar (Maybe a) -> STM a
@@ -329,17 +336,22 @@ waitJust var = readTVar var >>= \case
 type Millis = Int
 ticker :: Millis -> Juke Reactive ctx i i
 ticker millis = Juke $ do
-  pure $ \i -> retriggerOn () (threadDelay (millis * 1000)) *> pure i
+  pure $ \i -> triggerOn $ \emit -> forever ((threadDelay (millis * 1000)) *> emit i)
 
 -- |  After an initial run of a full build, this combinator will trigger a re-build
 -- of all downstream dependents each time the given a trigger resolves.
 -- The trigger should *block* until its condition has been fulfilled.
-retriggerOn :: a -> IO a -> Builder ctx a
-retriggerOn fstA waiter = Builder $ shiftT $ \cc -> do
-  let looper a = do
-         nextA <- lift $ withAsync (cc a) $ const (liftIO waiter)
-         looper nextA
-  looper fstA
+triggerOn :: ((a -> IO ()) -> IO ()) -> Builder ctx a
+triggerOn handler = Builder $ do
+  cvar <- newEmptyCVarIO
+  mToIO <- lift askRunInIO
+  let trig a = atomically $ putCVar cvar a
+  shiftT $ \cc -> liftIO $ do
+    withAsync (handler trig) $ \_ -> do
+        let looper a = do
+               nextA <- withAsync (mToIO $ cc a) $ \_ -> atomically (waitCVar cvar)
+               looper nextA
+        (atomically (waitCVar cvar)) >>= looper
 
 -- Never is a build-step which NEVER calls its continuation, and never completes
 never :: forall x i ctx. Juke Reactive ctx i x

@@ -83,6 +83,7 @@ test-suite juke-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Utils
       Paths_juke
   hs-source-dirs:
       test
