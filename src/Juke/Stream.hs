@@ -18,6 +18,18 @@ folded :: Foldable f => Juke Stream ctx (f i) i
 folded = Juke $ do
   pure $ emit . toList
 
+filtered :: (i -> Bool) -> Juke Stream ctx i i
+filtered p = Juke $ do
+  pure $ \i -> do
+    if p i then pure i
+           else bail
+
+
+
+
+
+
+
 
 
 

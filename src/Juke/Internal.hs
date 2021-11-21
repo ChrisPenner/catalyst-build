@@ -69,10 +69,11 @@ instance Exception BuildInvalidated where
 
 instance Arrow (Juke Stream ctx) where
   arr f = Juke $ pure (pure . f)
-  Juke setupL *** Juke setupR = Juke $ do
-    (lf, rf) <- liftA2 (,) setupL setupR
-    pure $ \(l, r) -> do
-      liftA2 (,) (lf l) (rf r)
+  (***) = error "Stream has a bad Strong instance"
+  -- Juke setupL *** Juke setupR = Juke $ do
+  --   (lf, rf) <- liftA2 (,) setupL setupR
+  --   pure $ \(l, r) -> do
+  --     liftA2 (,) (lf l) (rf r)
 
 instance Arrow (Juke Reactive ctx) where
   arr f = Juke $ pure (pure . f)

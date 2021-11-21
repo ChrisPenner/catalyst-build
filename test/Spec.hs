@@ -11,6 +11,7 @@ import Juke.React
 import UnliftIO.Async
 import Control.Concurrent
 import Control.Monad.IO.Class
+import Control.Monad
 
 
 assertOutputExact :: (Eq o, Show o) => [o] -> i -> Juke Stream Context i o -> Expectation
@@ -37,17 +38,17 @@ assertOutputPrefix expectedOut i j = do
 main :: IO ()
 main = hspec $ do
   describe "Stream" $ do
-    it "should terminate when ArrowStrong is used" $ do
-        assertOutputExact [('l', 'r')] () $ proc inp -> do
-          a <- returnA -< 'l'
-          b <- returnA -< 'r'
-          returnA -< (a, b)
+    -- it "should terminate when ArrowStrong is used" $ do
+    --     assertOutputExact [('l', 'r')] () $ proc inp -> do
+    --       a <- returnA -< 'l'
+    --       b <- returnA -< 'r'
+    --       returnA -< (a, b)
 
-    it "takes cartesian product w/r to Strong" $ do
-      assertOutputExact [(1,'a'),(1,'b'),(2,'a'),(2,'b')] () $ proc inp -> do
-          l <- folded -< [1, 2]
-          r <- folded -< ['a', 'b']
-          returnA -< (l, r)
+    -- it "takes cartesian product w/r to Strong" $ do
+    --   assertOutputExact [(1,'a'),(1,'b'),(2,'a'),(2,'b')] () $ proc inp -> do
+    --       l <- folded -< [1, 2]
+    --       r <- folded -< ['a', 'b']
+    --       returnA -< (l, r)
 
     it "should terminate when Choice is used" $ do
         assertOutputExact ["true"] True $ proc inp -> do
@@ -60,6 +61,16 @@ main = hspec $ do
     describe "take" $ do
       it "should take n then stop" $ do
         assertOutputExact [1, 2, 3] [1, 2, 3, 4, 5] $ folded >>> taking 3
+    describe "filtered" $ do
+      it "should take n then stop" $ do
+        assertOutputExact [1, 3, 5] [1, 2, 3, 4, 5] $ folded >>> filtered odd
+
+    -- describe "Strong" $ do
+      -- Strong is absolutely not necessary here, it's weird Arrow syntax uses it.
+      -- it "Should not use Strong unless necessary" $ do
+      --   assertOutputExact [1, 3, 5] [1, 2, 3, 4, 5] $ proc inp -> do
+      --       x <- folded -< inp
+      --       filtered odd -< x
 
   describe "Reactive" $ do
     it "should run Strong products in parallel, updating for change in either side" $ do
@@ -74,15 +85,17 @@ main = hspec $ do
         assertOutputExact [Just "newCtx"] () $ proc inp -> do
           withContext (useContext) -< ("newCtx", ())
 
-    -- describe "useEffect" $ do
-    --   it "should pick up on altered state" $ do
-    --     assertOutputExact [()] () $ proc inp -> do
-    --       useEffect -< (print "one", ())
-
     describe "useState" $ do
       it "should pick up on altered state" $ do
         assertOutputPrefix ["initial", "one", "two"] () $ proc inp -> do
           (s, updater) <- useState "initial" -< ()
           x <- useEffect -< (threadDelay 1000 *> updater (const "one") *> threadDelay 1000 *> updater (const "two"), ())
-          returnA <<< trace <<< arr fst -< (s, x)
+          returnA <<< arr fst -< (s, x)
+
+    describe "useEffect" $ do
+      it "should re-run the computation on a changed sentinel" $ do
+        assertOutputPrefix ["initial", "one", "one", "one"] () $ proc inp -> do
+          (s, updater) <- useState "initial" -< ()
+          x <- useEffect -< (forever $ updater (const "one") *> threadDelay 1000, s)
+          returnA <<< arr fst -< (s, x)
 
